@@ -4,21 +4,14 @@ classdef ModelManager < handle
         Diagnostics
     end
     methods
-        function obj=ModelManager(diag)
-            obj.Diagnostics=diag;
-        end
+        function obj=ModelManager(diag), obj.Diagnostics=diag; end
         function loadModel(obj,model)
             model=char(model);
             if isempty(model), error('SmartDebugger:EmptyModel','Model is empty.'); end
-            [~,name,ext]=fileparts(model);
-            if isempty(ext), name= model; else, name=[name ext]; end
             try
-                if exist(model,'file')==2 || bdIsLoaded(erase(name,{'.slx','.mdl'}))
-                    load_system(model);
-                else
-                    error('SmartDebugger:ModelNotFound','Model file not found: %s',model);
-                end
-                [~,n,~]=fileparts(model); obj.Model=n;
+                [~,n,ext]=fileparts(model); root=n;
+                if isempty(ext) && ~bdIsLoaded(root), load_system(root); elseif exist(model,'file')==2, load_system(model); elseif ~bdIsLoaded(root), error('SmartDebugger:ModelNotFound','Model file not found: %s',model); end
+                obj.Model=root;
             catch ME
                 obj.Diagnostics.recordException(ME,'Load model'); rethrow(ME);
             end
@@ -27,18 +20,12 @@ classdef ModelManager < handle
             path='';
             try
                 if isempty(obj.Model), return; end
-                sel=get_param(obj.Model,'CurrentSystem'); %#ok<NASGU>
-                h=gcs;
-                if isempty(h), return; end
-                b=find_system(h,'SearchDepth',1,'Selected','on');
-                if isempty(b)
-                    try
-                        b=get_param(obj.Model,'SelectedBlocks');
-                    catch
-                        b={};
-                    end
+                b=get_param(0,'SelectedBlocks');
+                if ischar(b) && ~isempty(b), path=b; elseif iscell(b) && ~isempty(b), path=char(b{1}); end
+                if isempty(path)
+                    cb=get_param(0,'CurrentBlock');
+                    if ischar(cb), path=cb; end
                 end
-                if ~isempty(b), path=char(b{1}); end
             catch ME
                 obj.Diagnostics.recordException(ME,'Read selection');
             end
@@ -47,16 +34,12 @@ classdef ModelManager < handle
             info=[];
             try
                 if isempty(path), return; end
-                if ~bdIsLoaded(bdroot(path)), load_system(bdroot(path)); end
+                root=bdroot(path); if ~bdIsLoaded(root), load_system(root); end
                 get_param(path,'Handle');
-                info.Path=path;
-                info.Name=get_param(path,'Name');
-                info.BlockType=get_param(path,'BlockType');
-                info.Parent=get_param(path,'Parent');
-                info.LibraryLink=get_param(path,'ReferenceBlock');
-                info.MaskType=get_param(path,'MaskType');
-                info.Inputs=obj.portInfo(path,'Inport');
-                info.Outputs=obj.portInfo(path,'Outport');
+                set_param(root,'SimulationCommand','update');
+                info.Path=path; info.Name=get_param(path,'Name'); info.BlockType=get_param(path,'BlockType');
+                info.Parent=get_param(path,'Parent'); info.LibraryLink=get_param(path,'ReferenceBlock'); info.MaskType=get_param(path,'MaskType');
+                info.Inputs=obj.portInfo(path,'Inport'); info.Outputs=obj.portInfo(path,'Outport');
             catch ME
                 obj.Diagnostics.recordException(ME,'Inspect block');
             end
@@ -68,30 +51,17 @@ classdef ModelManager < handle
                 if strcmp(direction,'Inport'), hs=ph.Inport; else, hs=ph.Outport; end
                 for k=1:numel(hs)
                     p=struct('Port',k,'Name','','Value','','DataType','','Dimension','','SampleTime','');
+                    line=get_param(hs(k),'Line');
+                    if isempty(line) || isequal(line,-1), p.Name=sprintf('%s %d',direction,k); else, p.Name=smartdebugger.SignalNameResolver.resolve(line,k,direction); end
                     try
-                        line=get_param(hs(k),'Line');
-                        if line~=-1
-                            nm=get_param(line,'Name');
-                            if isempty(nm), nm=sprintf('%s %d',direction,k); end
-                        else
-                            nm=sprintf('%s %d',direction,k);
-                        end
+                        if strcmp(direction,'Inport'), d=get_param(path,'CompiledPortDataTypes'); dim=get_param(path,'CompiledPortDimensions'); st=get_param(path,'CompiledPortSampleTimes');
+                        else, d=get_param(path,'CompiledPortDataTypes'); dim=get_param(path,'CompiledPortDimensions'); st=get_param(path,'CompiledPortSampleTimes'); end
+                        idx=k;
+                        if strcmp(direction,'Inport') && isfield(d,'Inport'), p.DataType=char(d.Inport{idx}); p.Dimension=mat2str(dim.Inport(idx,:)); p.SampleTime=mat2str(st.Inport(idx,:));
+                        elseif strcmp(direction,'Outport') && isfield(d,'Outport'), p.DataType=char(d.Outport{idx}); p.Dimension=mat2str(dim.Outport(idx,:)); p.SampleTime=mat2str(st.Outport(idx,:)); end
                     catch
-                        nm=sprintf('%s %d',direction,k);
+                        % Compiled metadata is release-dependent; leave fields blank rather than guess.
                     end
-                    p.Name=nm;
-                    try
-                        dt=get_param(hs(k),'CompiledPortDataType'); if isempty(dt), dt=''; end
-                    catch, dt=''; end
-                    try
-                        dim=get_param(hs(k),'CompiledPortDimensions');
-                        if isnumeric(dim), dim=mat2str(dim); end
-                    catch, dim=''; end
-                    try
-                        st=get_param(hs(k),'CompiledPortSampleTime');
-                        if isnumeric(st), st=mat2str(st); end
-                    catch, st=''; end
-                    p.DataType=char(dt); p.Dimension=char(dim); p.SampleTime=char(st);
                     ports(end+1)=p; %#ok<AGROW>
                 end
             catch ME
