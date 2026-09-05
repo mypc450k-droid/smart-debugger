@@ -4,8 +4,6 @@ classdef TimeAlignmentEngine
             if nargin<5 || isempty(method), method='linear'; end
             aTime=aTime(:); bTime=bTime(:);
             if isempty(aTime) || isempty(bTime), t=[]; a=[]; b=[]; return; end
-            t=(max(aTime(1),bTime(1)):0:max(aTime(end),bTime(end)))'; %#ok<NBRAK>
-            % The expression above is intentionally replaced by a robust common grid.
             t=unique([aTime;bTime]);
             lo=max(aTime(1),bTime(1)); hi=min(aTime(end),bTime(end));
             t=t(t>=lo & t<=hi);
