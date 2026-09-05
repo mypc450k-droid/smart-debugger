@@ -1,5 +1,9 @@
 classdef SmartDebuggerApp < handle
-    %SMARTDEBUGGERAPP Main programmatic UI for MIL/SIL debugging.
+    %SMARTDEBUGGERAPP Professional programmatic Smart Debugger UI.
+    %
+    % The UI deliberately delegates model, simulation and comparison work to
+    % service classes so the debugging engine is not coupled to callbacks.
+
     properties (SetAccess=private)
         UIFigure
         ModelManager
@@ -9,24 +13,35 @@ classdef SmartDebuggerApp < handle
         CompatibilityManager
         Mode = "MIL"
         SelectedBlock = ""
+        SelectedSILBlock = ""
         MILResult = []
         SILResult = []
     end
+
     properties (Access=private)
-        ModelField
+        MILModelField
         SILModelField
         StopTimeField
         ModeGroup
         BlockField
+        SILBlockField
         InputsTable
         OutputsTable
-        StatusLabel
-        DiagnosticsArea
         ComparisonTable
-        Axes
-        ToleranceAbsField
-        ToleranceRelField
+        DiagnosticsArea
+        PlotAxes
+        StatusLabel
+        CompatibilityLabel
+        BlockInfoArea
+        FirstDivergenceLabel
+        AbsToleranceField
+        RelToleranceField
+        AlignmentDropDown
+        Tree
+        SelectionTimer
+        Busy = false
     end
+
     methods
         function obj = SmartDebuggerApp(varargin)
             obj.DiagnosticsManager = smartdebugger.DiagnosticsManager();
@@ -35,190 +50,556 @@ classdef SmartDebuggerApp < handle
             obj.SimulationManager = smartdebugger.SimulationManager(obj.DiagnosticsManager);
             obj.ComparisonEngine = smartdebugger.ComparisonEngine();
             obj.buildUI();
+            obj.updateCompatibility();
+            obj.startSelectionWatcher();
             if ~isempty(varargin)
                 obj.configure(varargin{:});
             end
-            obj.updateCompatibility();
         end
+
         function configure(obj,varargin)
-            p = inputParser;
+            p=inputParser;
             addParameter(p,'Model','',@(x)ischar(x)||isstring(x));
             addParameter(p,'SILModel','',@(x)ischar(x)||isstring(x));
             parse(p,varargin{:});
-            if strlength(string(p.Results.Model)) > 0, obj.setMILModel(p.Results.Model); end
-            if strlength(string(p.Results.SILModel)) > 0, obj.SILModelField.Value = char(p.Results.SILModel); end
+            if strlength(string(p.Results.Model))>0
+                obj.setMILModel(p.Results.Model);
+            end
+            if strlength(string(p.Results.SILModel))>0
+                obj.setSILModel(p.Results.SILModel);
+            end
         end
+
         function setMILModel(obj,model)
-            obj.ModelField.Value = char(model);
-            obj.ModelManager.loadModel(char(model));
-            obj.status("MIL model loaded: " + string(model));
-            obj.refreshBlockSelection();
+            try
+                obj.ModelManager.loadModel(model);
+                obj.MILModelField.Value=char(model);
+                obj.refreshModelTree();
+                obj.refreshBlockSelection();
+                obj.status("MIL model loaded: " + string(model));
+            catch ME
+                obj.handleError(ME,'Load MIL model');
+            end
         end
+
+        function setSILModel(obj,model)
+            try
+                model=char(string(model));
+                if isempty(strtrim(model)), return; end
+                [~,root,ext]=fileparts(model);
+                if isempty(ext) && ~bdIsLoaded(root)
+                    load_system(root);
+                elseif ~isempty(ext)
+                    load_system(model);
+                end
+                obj.SILModelField.Value=model;
+                obj.status("SIL model ready: " + string(model));
+            catch ME
+                obj.handleError(ME,'Load SIL model');
+            end
+        end
+
         function refreshBlockSelection(obj)
             try
-                path = obj.ModelManager.currentSimulinkSelection();
-                if strlength(string(path)) > 0
-                    obj.SelectedBlock = string(path);
-                    obj.BlockField.Value = char(path);
-                    obj.inspectBlock();
-                else
-                    obj.status("No Simulink block is currently selected.");
+                path=obj.ModelManager.currentSimulinkSelection();
+                if isempty(path)
+                    obj.status('No selected Simulink block. Select one in the model, then click Import Selection.');
+                    return;
                 end
+                obj.setSelectedBlock(path);
             catch ME
-                obj.DiagnosticsManager.recordException(ME,'Selection');
-                obj.showDiagnostics();
+                obj.handleError(ME,'Import selection');
             end
         end
+
+        function setSelectedBlock(obj,path)
+            path=char(string(path));
+            if isempty(path), return; end
+            obj.SelectedBlock=string(path);
+            obj.BlockField.Value=path;
+            obj.inspectBlock();
+        end
+
         function inspectBlock(obj)
-            path = strtrim(string(obj.BlockField.Value));
-            if path == "", return; end
-            obj.SelectedBlock = path;
-            info = obj.ModelManager.inspectBlock(char(path));
+            path=strtrim(string(obj.BlockField.Value));
+            if path=="", return; end
+            info=obj.ModelManager.inspectBlock(char(path));
             if isempty(info)
-                obj.status("Block could not be inspected.");
-                return
+                obj.status('Unable to inspect selected block. See Diagnostics.');
+                obj.showDiagnostics();
+                return;
             end
+            obj.SelectedBlock=path;
             obj.populatePorts(info);
+            obj.populateBlockInfo(info);
             obj.status("Selected: " + path);
+            obj.updateModelTreeSelection(path);
         end
+
         function runDebug(obj)
+            if obj.Busy, return; end
+            obj.clearTransientDiagnostics();
+            obj.setBusy(true);
             try
+                obj.validateRunInputs();
                 obj.inspectBlock();
-                model = char(obj.ModelField.Value);
-                block = char(obj.SelectedBlock);
-                stopTime = char(obj.StopTimeField.Value);
-                if isempty(model) || isempty(block)
-                    error('SmartDebugger:MissingTarget','Select a model and block first.');
-                end
-                obj.setBusy(true);
-                if obj.Mode == "MIL"
-                    obj.MILResult = obj.SimulationManager.runMIL(model,block,stopTime);
-                    result = obj.MILResult;
+                stopTime=strtrim(string(obj.StopTimeField.Value));
+                if obj.Mode=="MIL"
+                    model=char(obj.MILModelField.Value);
+                    block=char(obj.SelectedBlock);
+                    obj.MILResult=obj.SimulationManager.runMIL(model,block,stopTime);
+                    result=obj.MILResult;
                 else
-                    silModel = char(obj.SILModelField.Value);
-                    if isempty(silModel), error('SmartDebugger:MissingSILModel','Specify a SIL model before SIL debugging.'); end
-                    result = obj.SimulationManager.runSIL(silModel,block,stopTime);
-                    obj.SILResult = result;
+                    silModel=char(obj.SILModelField.Value);
+                    [silBlock,confidence,mapMethod,candidates]= ...
+                        smartdebugger.ModelMapper.mapBlock(char(obj.SelectedBlock),silModel);
+                    if isempty(silBlock)
+                        if strlength(string(obj.SILBlockField.Value))>0
+                            silBlock=char(obj.SILBlockField.Value);
+                            confidence='USER_DEFINED';
+                            mapMethod='USER_DEFINED';
+                        else
+                            error('SmartDebugger:SILMappingRequired', ...
+                                'Automatic MIL-to-SIL mapping failed. Specify the SIL block path manually.');
+                        end
+                    end
+                    if strcmp(confidence,'AMBIGUOUS')
+                        msg=sprintf('SIL mapping is ambiguous for %s. Candidates: %s', ...
+                            char(obj.SelectedBlock),strjoin(candidates,', '));
+                        error('SmartDebugger:AmbiguousSILMapping',msg);
+                    end
+                    obj.SelectedSILBlock=string(silBlock);
+                    obj.SILBlockField.Value=silBlock;
+                    obj.SILResult=obj.SimulationManager.runSIL(silModel,silBlock,stopTime);
+                    obj.SILResult.MappingConfidence=confidence;
+                    obj.SILResult.MappingMethod=mapMethod;
+                    result=obj.SILResult;
                 end
                 obj.displayRuntimeResult(result);
-                obj.status(obj.Mode + " debug completed.");
+                obj.status(obj.Mode + " simulation completed: " + string(result.Status));
             catch ME
-                obj.DiagnosticsManager.recordException(ME,'Debug run');
-                obj.status("Debug run failed. See Diagnostics.");
-                obj.showDiagnostics();
+                obj.handleError(ME,'Debug run');
             end
             obj.setBusy(false);
         end
+
         function compare(obj)
+            if obj.Busy, return; end
             try
                 if isempty(obj.MILResult) || isempty(obj.SILResult)
-                    error('SmartDebugger:MissingResults','Run both MIL and SIL before comparison.');
+                    error('SmartDebugger:MissingResults', ...
+                        'Run MIL and SIL successfully before comparison.');
                 end
-                a = str2double(obj.ToleranceAbsField.Value);
-                r = str2double(obj.ToleranceRelField.Value);
-                report = obj.ComparisonEngine.compare(obj.MILResult,obj.SILResult,a,r);
-                obj.displayComparison(report);
+                a=str2double(obj.AbsToleranceField.Value);
+                r=str2double(obj.RelToleranceField.Value);
+                if isnan(a) || isnan(r) || a<0 || r<0
+                    error('SmartDebugger:InvalidTolerance','Tolerances must be finite nonnegative numbers.');
+                end
+                report=obj.ComparisonEngine.compare(obj.MILResult,obj.SILResult,a,r, ...
+                    char(obj.AlignmentDropDown.Value));
+                obj.ComparisonTable.Data=report.Table;
                 obj.plotComparison(report);
+                if strcmp(report.Status,'PASS')
+                    obj.FirstDivergenceLabel.Text='MIL vs SIL: PASS | No mismatch outside tolerance';
+                else
+                    fd=report.FirstDivergence;
+                    if isnan(fd.Time)
+                        obj.FirstDivergenceLabel.Text='MIL vs SIL: FAIL | Divergence detected';
+                    else
+                        obj.FirstDivergenceLabel.Text=sprintf( ...
+                            'FIRST OBSERVED DIVERGENCE: %s / Port %d at t = %.12g s', ...
+                            fd.Direction,fd.Port,fd.Time);
+                    end
+                end
                 obj.status("Comparison completed: " + string(report.Status));
             catch ME
-                obj.DiagnosticsManager.recordException(ME,'MIL/SIL comparison');
-                obj.showDiagnostics();
+                obj.handleError(ME,'MIL/SIL comparison');
             end
         end
+
+        function navigateToBlock(obj)
+            path=strtrim(string(obj.BlockField.Value));
+            if path=="", return; end
+            try
+                open_system(char(path));
+                try, hilite_system(char(path),'find'); catch, end
+                obj.status("Opened: " + path);
+            catch ME
+                obj.handleError(ME,'Open selected block');
+            end
+        end
+
         function showDiagnostics(obj)
             if isempty(obj.DiagnosticsArea) || ~isvalid(obj.DiagnosticsArea), return; end
-            obj.DiagnosticsArea.Value = obj.DiagnosticsManager.asCell();
+            obj.DiagnosticsArea.Value=obj.DiagnosticsManager.asCell();
+        end
+
+        function closeApp(obj)
+            try
+                if ~isempty(obj.SelectionTimer) && isvalid(obj.SelectionTimer)
+                    stop(obj.SelectionTimer);
+                    delete(obj.SelectionTimer);
+                end
+            catch
+            end
+            if ~isempty(obj.UIFigure) && isvalid(obj.UIFigure)
+                delete(obj.UIFigure);
+            end
         end
     end
+
     methods (Access=private)
         function buildUI(obj)
-            obj.UIFigure = uifigure('Name','Smart Debugger','Position',[80 60 1400 820]);
-            obj.UIFigure.CloseRequestFcn = @(~,~)obj.closeApp();
-            g = uigridlayout(obj.UIFigure,[3 3]);
-            g.RowHeight = {55,'1x',190}; g.ColumnWidth = {270,'1x',360};
-            top = uipanel(g); top.Layout.Row=1; top.Layout.Column=[1 3];
-            tg = uigridlayout(top,[1 10]); tg.ColumnWidth={90,170,170,80,80,90,90,90,90,'1x'};
-            uibutton(tg,'Text','Open MIL','ButtonPushedFcn',@(~,~)obj.chooseMIL());
-            obj.ModelField = uieditfield(tg,'text','Placeholder','MIL model');
-            obj.SILModelField = uieditfield(tg,'text','Placeholder','SIL model');
-            obj.ModeGroup = uidropdown(tg,'Items',{'MIL','SIL'},'Value','MIL','ValueChangedFcn',@(s,~)obj.modeChanged(s));
-            uibutton(tg,'Text','Import Selection','ButtonPushedFcn',@(~,~)obj.refreshBlockSelection());
-            uibutton(tg,'Text','Inspect','ButtonPushedFcn',@(~,~)obj.inspectBlock());
-            uibutton(tg,'Text','Debug','ButtonPushedFcn',@(~,~)obj.runDebug());
-            uibutton(tg,'Text','Compare','ButtonPushedFcn',@(~,~)obj.compare());
-            obj.StopTimeField = uieditfield(tg,'text','Value','10');
-            obj.StatusLabel = uilabel(tg,'Text','Ready');
-            left = uipanel(g,'Title','Debug Target'); left.Layout.Row=2; left.Layout.Column=1;
-            lg=uigridlayout(left,[5 1]); lg.RowHeight={22,35,35,'1x',35};
-            uilabel(lg,'Text','Selected block path');
-            obj.BlockField=uieditfield(lg,'text','Placeholder','model/subsystem/block');
-            uibutton(lg,'Text','Inspect block','ButtonPushedFcn',@(~,~)obj.inspectBlock());
-            obj.DiagnosticsArea=uitextarea(lg,'Editable','off','Value',{'Diagnostics'});
-            uibutton(lg,'Text','Refresh diagnostics','ButtonPushedFcn',@(~,~)obj.showDiagnostics());
-            center=uipanel(g,'Title','Runtime Signals'); center.Layout.Row=2; center.Layout.Column=2;
-            cg=uigridlayout(center,[3 1]); cg.RowHeight={'1x','1x','1x'};
-            obj.InputsTable=uitable(cg,'ColumnName',{'Port','Name','Value','Type','Size','SampleTime'});
-            obj.OutputsTable=uitable(cg,'ColumnName',{'Port','Name','Value','Type','Size','SampleTime'});
-            obj.ComparisonTable=uitable(cg,'ColumnName',{'Signal','Status','MaxAbsError','MaxRelError','FirstMismatch'});
-            right=uipanel(g,'Title','Comparison / Settings'); right.Layout.Row=2; right.Layout.Column=3;
-            rg=uigridlayout(right,[6 2]); rg.RowHeight={25,25,25,25,'1x',30};
-            uilabel(rg,'Text','Absolute tolerance'); obj.ToleranceAbsField=uieditfield(rg,'text','Value','1e-6');
-            uilabel(rg,'Text','Relative tolerance'); obj.ToleranceRelField=uieditfield(rg,'text','1e-4');
-            uilabel(rg,'Text','Mode'); uilabel(rg,'Text','MIL / SIL');
-            uilabel(rg,'Text','Model compatibility'); uilabel(rg,'Text','Checking...','Tag','Compatibility');
-            obj.Axes=uiaxes(rg); obj.Axes.Layout.Row=[5 6]; obj.Axes.Layout.Column=[1 2];
-            bottom=uipanel(g,'Title','Instructions'); bottom.Layout.Row=3; bottom.Layout.Column=[1 3];
-            uitextarea(bottom,'Editable','off','Value',{ ...
-                'Workflow: open MIL model -> select a block in Simulink -> Import Selection -> Inspect -> Debug.', ...
-                'For SIL, enter the SIL model and select SIL mode. Use Compare after both simulations complete.', ...
-                'The app uses adapters and capability checks. Unsupported runtime inspection is reported rather than fabricated.', ...
-                'No permanent Scope/To Workspace/TargetLink Sink blocks are created by this application.'});
+            obj.UIFigure=uifigure('Name','Smart Debugger', ...
+                'Position',[70 50 1500 900], ...
+                'Color',[0.96 0.97 0.98], ...
+                'CloseRequestFcn',@(~,~)obj.closeApp());
+
+            root=uigridlayout(obj.UIFigure,[4 3]);
+            root.RowHeight={72,'1x',250,30};
+            root.ColumnWidth={310,'1x',390};
+            root.Padding=[8 8 8 8];
+            root.RowSpacing=8; root.ColumnSpacing=8;
+
+            obj.buildToolbar(root);
+            obj.buildLeftPanel(root);
+            obj.buildCenterPanel(root);
+            obj.buildRightPanel(root);
+            obj.buildPlotPanel(root);
+            obj.buildStatusBar(root);
         end
+
+        function buildToolbar(obj,parent)
+            p=uipanel(parent,'Title','');
+            p.Layout.Row=1; p.Layout.Column=[1 3];
+            g=uigridlayout(p,[2 12]);
+            g.RowHeight={30,30};
+            g.ColumnWidth={82,220,82,220,75,82,92,92,92,80,90,'1x'};
+            uibutton(g,'Text','Open MIL','ButtonPushedFcn',@(~,~)obj.chooseMIL());
+            obj.MILModelField=uieditfield(g,'text','Placeholder','MIL model path');
+            uibutton(g,'Text','Open SIL','ButtonPushedFcn',@(~,~)obj.chooseSIL());
+            obj.SILModelField=uieditfield(g,'text','Placeholder','SIL model path');
+            obj.ModeGroup=uidropdown(g,'Items',{'MIL','SIL'},'Value','MIL', ...
+                'ValueChangedFcn',@(s,~)obj.modeChanged(s));
+            uibutton(g,'Text','Import','ButtonPushedFcn',@(~,~)obj.refreshBlockSelection());
+            uibutton(g,'Text','Inspect','ButtonPushedFcn',@(~,~)obj.inspectBlock());
+            uibutton(g,'Text','Run Debug','ButtonPushedFcn',@(~,~)obj.runDebug());
+            uibutton(g,'Text','Compare','ButtonPushedFcn',@(~,~)obj.compare());
+            obj.StopTimeField=uieditfield(g,'text','Value','10','Tooltip','Simulation stop time');
+            uilabel(g,'Text','Stop time');
+            obj.StatusLabel=uilabel(g,'Text','Ready','HorizontalAlignment','left');
+            obj.StatusLabel.Layout.Row=2; obj.StatusLabel.Layout.Column=[1 12];
+        end
+
+        function buildLeftPanel(obj,parent)
+            p=uipanel(parent,'Title','Model / Debug Target');
+            p.Layout.Row=2; p.Layout.Column=1;
+            g=uigridlayout(p,[9 1]);
+            g.RowHeight={22,'1x',32,22,32,22,32,'1x',32};
+            uilabel(g,'Text','Model hierarchy');
+            obj.Tree=uitree(g,'SelectionChangedFcn',@(s,e)obj.treeSelectionChanged(e));
+            uibutton(g,'Text','Refresh model tree','ButtonPushedFcn',@(~,~)obj.refreshModelTree());
+            uilabel(g,'Text','MIL selected block');
+            obj.BlockField=uieditfield(g,'text','Placeholder','model/subsystem/block');
+            uibutton(g,'Text','Open / Highlight','ButtonPushedFcn',@(~,~)obj.navigateToBlock());
+            uilabel(g,'Text','SIL mapped block (optional override)');
+            obj.SILBlockField=uieditfield(g,'text','Placeholder','SIL model/subsystem/block');
+            uibutton(g,'Text','Inspect selected block','ButtonPushedFcn',@(~,~)obj.inspectBlock());
+        end
+
+        function buildCenterPanel(obj,parent)
+            p=uipanel(parent,'Title','Runtime Signals');
+            p.Layout.Row=2; p.Layout.Column=2;
+            g=uigridlayout(p,[4 1]);
+            g.RowHeight={'1x','1x','1x',30};
+            obj.InputsTable=uitable(g,'ColumnName',{'Port','Input Signal','Current Value','Data Type','Dimension','Sample Time'}, ...
+                'RowName',{},'ColumnEditable',false(1,6));
+            obj.OutputsTable=uitable(g,'ColumnName',{'Port','Output Signal','Current Value','Data Type','Dimension','Sample Time'}, ...
+                'RowName',{},'ColumnEditable',false(1,6));
+            obj.ComparisonTable=uitable(g,'ColumnName', ...
+                {'Direction','Port','MIL Signal','SIL Signal','Status','Max Abs Error','Max Rel Error','First Mismatch'}, ...
+                'RowName',{},'ColumnEditable',false(1,8));
+            obj.FirstDivergenceLabel=uilabel(g,'Text','No MIL/SIL comparison run yet', ...
+                'FontWeight','bold','HorizontalAlignment','left');
+        end
+
+        function buildRightPanel(obj,parent)
+            p=uipanel(parent,'Title','Analysis / Diagnostics');
+            p.Layout.Row=2; p.Layout.Column=3;
+            g=uigridlayout(p,[8 2]);
+            g.RowHeight={22,28,22,28,22,28,'1x',34};
+            g.ColumnWidth={145,'1x'};
+            uilabel(g,'Text','Absolute tolerance');
+            obj.AbsToleranceField=uieditfield(g,'text','Value','1e-6');
+            uilabel(g,'Text','Relative tolerance');
+            obj.RelToleranceField=uieditfield(g,'text','Value','1e-4');
+            uilabel(g,'Text','Time alignment');
+            obj.AlignmentDropDown=uidropdown(g,'Items',{'linear','nearest','zoh'},'Value','linear');
+            uilabel(g,'Text','Compatibility');
+            obj.CompatibilityLabel=uilabel(g,'Text','Checking...');
+            uilabel(g,'Text','Selected block');
+            obj.BlockInfoArea=uitextarea(g,'Editable','off','Value',{'No block selected.'});
+            obj.BlockInfoArea.Layout.Row=[5 6]; obj.BlockInfoArea.Layout.Column=2;
+            uilabel(g,'Text','Diagnostics');
+            obj.DiagnosticsArea=uitextarea(g,'Editable','off','Value',{'No diagnostics.'});
+            obj.DiagnosticsArea.Layout.Row=7; obj.DiagnosticsArea.Layout.Column=[1 2];
+            uibutton(g,'Text','Refresh diagnostics','ButtonPushedFcn',@(~,~)obj.showDiagnostics());
+            uibutton(g,'Text','Clear diagnostics','ButtonPushedFcn',@(~,~)obj.clearDiagnostics());
+        end
+
+        function buildPlotPanel(obj,parent)
+            p=uipanel(parent,'Title','MIL / SIL Trace');
+            p.Layout.Row=3; p.Layout.Column=[1 3];
+            obj.PlotAxes=uiaxes(p,'Position',[10 10 1470 205]);
+            title(obj.PlotAxes,'Selected signal comparison');
+            xlabel(obj.PlotAxes,'Time (s)');
+            ylabel(obj.PlotAxes,'Value / Error');
+            grid(obj.PlotAxes,'on');
+        end
+
+        function buildStatusBar(obj,parent)
+            p=uipanel(parent);
+            p.Layout.Row=4; p.Layout.Column=[1 3];
+            g=uigridlayout(p,[1 2]);
+            g.ColumnWidth={'1x',350};
+            uilabel(g,'Text','Smart Debugger | Non-destructive runtime capture | MIL + SIL');
+            uilabel(g,'Text','');
+        end
+
         function chooseMIL(obj)
-            [f,p]=uigetfile({'*.slx;*.mdl','Simulink Models'},'Select MIL model');
+            [f,p]=uigetfile({'*.slx;*.mdl','Simulink Models (*.slx, *.mdl)'},'Select MIL model');
             if isequal(f,0), return; end
             obj.setMILModel(fullfile(p,f));
         end
+
+        function chooseSIL(obj)
+            [f,p]=uigetfile({'*.slx;*.mdl','Simulink Models (*.slx, *.mdl)'},'Select SIL model');
+            if isequal(f,0), return; end
+            obj.setSILModel(fullfile(p,f));
+        end
+
         function modeChanged(obj,s)
-            obj.Mode=string(s.Value); obj.status("Mode: " + obj.Mode);
+            obj.Mode=string(s.Value);
+            obj.status("Mode: " + obj.Mode);
         end
-        function updateCompatibility(obj)
-            c=obj.CompatibilityManager.snapshot();
-            obj.status("Ready | " + string(c.MATLAB));
+
+        function validateRunInputs(obj)
+            if isempty(strtrim(string(obj.MILModelField.Value)))
+                error('SmartDebugger:MissingMILModel','Select a MIL model first.');
+            end
+            if isempty(strtrim(string(obj.BlockField.Value)))
+                error('SmartDebugger:MissingBlock','Select or enter a MIL block path first.');
+            end
+            stopTime=str2double(obj.StopTimeField.Value);
+            if isnan(stopTime) || ~isfinite(stopTime) || stopTime<0
+                error('SmartDebugger:InvalidStopTime','Stop time must be a finite nonnegative number.');
+            end
+            if obj.Mode=="SIL" && isempty(strtrim(string(obj.SILModelField.Value)))
+                error('SmartDebugger:MissingSILModel','Select a SIL model first.');
+            end
         end
+
         function populatePorts(obj,info)
             obj.InputsTable.Data=obj.portRows(info.Inputs);
             obj.OutputsTable.Data=obj.portRows(info.Outputs);
         end
-        function rows=portRows( obj, ports ) %#ok<INUSD>
+
+        function rows=portRows(~,ports)
             if isempty(ports), rows=cell(0,6); return; end
             rows=cell(numel(ports),6);
             for k=1:numel(ports)
-                p=ports(k); rows{k,1}=p.Port; rows{k,2}=p.Name; rows{k,3}=p.Value;
-                rows{k,4}=p.DataType; rows{k,5}=p.Dimension; rows{k,6}=p.SampleTime;
+                p=ports(k);
+                rows{k,1}=p.Port;
+                rows{k,2}=p.Name;
+                rows{k,3}=localFormatValue(p.Value);
+                rows{k,4}=p.DataType;
+                rows{k,5}=p.Dimension;
+                rows{k,6}=p.SampleTime;
             end
         end
+
         function displayRuntimeResult(obj,result)
             if ~isstruct(result), return; end
             if isfield(result,'Inputs'), obj.InputsTable.Data=obj.portRows(result.Inputs); end
             if isfield(result,'Outputs'), obj.OutputsTable.Data=obj.portRows(result.Outputs); end
-        end
-        function displayComparison(obj,report)
-            obj.ComparisonTable.Data=report.Table;
-        end
-        function plotComparison(obj,report)
-            cla(obj.Axes);
-            if isfield(report,'Time') && ~isempty(report.Time)
-                hold(obj.Axes,'on');
-                if isfield(report,'MIL'), plot(obj.Axes,report.Time,report.MIL,'DisplayName','MIL'); end
-                if isfield(report,'SIL'), plot(obj.Axes,report.Time,report.SIL,'DisplayName','SIL'); end
-                if isfield(report,'Error'), plot(obj.Axes,report.Time,report.Error,'DisplayName','Error'); end
-                hold(obj.Axes,'off'); legend(obj.Axes,'show'); grid(obj.Axes,'on');
+            if isfield(result,'Status') && strcmp(result.Status,'PARTIAL')
+                obj.status('Simulation completed with partial capture. See Diagnostics.');
             end
         end
-        function status(obj,msg), obj.StatusLabel.Text=char(msg); end
-        function setBusy(obj,b), obj.UIFigure.Pointer = ternary(b,'watch','arrow'); drawnow; end
-        function closeApp(obj), delete(obj.UIFigure); end
+
+        function populateBlockInfo(obj,info)
+            lines={};
+            lines{end+1}=['Name: ' char(info.Name)];
+            lines{end+1}=['Type: ' char(info.BlockType)];
+            lines{end+1}=['Path: ' char(info.Path)];
+            if isfield(info,'LibraryLink') && ~isempty(info.LibraryLink)
+                lines{end+1}=['Library: ' char(info.LibraryLink)];
+            end
+            if isfield(info,'MaskType') && ~isempty(info.MaskType)
+                lines{end+1}=['Mask: ' char(info.MaskType)];
+            end
+            if isfield(info,'LinkStatus') && ~isempty(info.LinkStatus)
+                lines{end+1}=['Link status: ' char(info.LinkStatus)];
+            end
+            obj.BlockInfoArea.Value=lines;
+        end
+
+        function plotComparison(obj,report)
+            cla(obj.PlotAxes);
+            if isempty(report.Time), return; end
+            hold(obj.PlotAxes,'on');
+            localPlot(obj.PlotAxes,report.Time,report.MIL,'MIL');
+            localPlot(obj.PlotAxes,report.Time,report.SIL,'SIL');
+            localPlot(obj.PlotAxes,report.Time,report.Error,'MIL - SIL');
+            hold(obj.PlotAxes,'off');
+            legend(obj.PlotAxes,'show','Location','best');
+            title(obj.PlotAxes,['Comparison: ' char(report.Signal)]);
+            grid(obj.PlotAxes,'on');
+        end
+
+        function refreshModelTree(obj)
+            delete(obj.Tree.Children);
+            model=strtrim(string(obj.MILModelField.Value));
+            if model=="", return; end
+            try
+                [~,root,~]=fileparts(char(model));
+                if ~bdIsLoaded(root), load_system(root); end
+                rootNode=uitreenode(obj.Tree,'Text',root,'NodeData',root);
+                children=find_system(root,'SearchDepth',1,'Type','Block');
+                children=children(~strcmp(children,root));
+                for k=1:numel(children)
+                    uitreenode(rootNode,'Text',get_param(children{k},'Name'), ...
+                        'NodeData',children{k});
+                end
+                expand(rootNode);
+            catch ME
+                obj.DiagnosticsManager.recordException(ME,'Model tree');
+                obj.showDiagnostics();
+            end
+        end
+
+        function treeSelectionChanged(obj,event)
+            try
+                node=event.SelectedNodes;
+                if isempty(node), return; end
+                path=node(1).NodeData;
+                if ischar(path) && contains(path,'/')
+                    obj.setSelectedBlock(path);
+                end
+            catch ME
+                obj.DiagnosticsManager.recordException(ME,'Tree selection');
+            end
+        end
+
+        function updateModelTreeSelection(~,~)
+            % Tree selection is intentionally not forced because MATLAB tree
+            % selection APIs differ across releases. The block path is the source
+            % of truth.
+        end
+
+        function startSelectionWatcher(obj)
+            try
+                obj.SelectionTimer=timer('ExecutionMode','fixedSpacing', ...
+                    'Period',0.75,'BusyMode','drop', ...
+                    'TimerFcn',@(~,~)obj.pollSelection());
+                start(obj.SelectionTimer);
+            catch ME
+                obj.DiagnosticsManager.recordException(ME,'Selection watcher');
+            end
+        end
+
+        function pollSelection(obj)
+            if obj.Busy || isempty(obj.ModelManager.Model), return; end
+            try
+                path=obj.ModelManager.currentSimulinkSelection();
+                if ~isempty(path) && ~strcmp(path,char(obj.SelectedBlock))
+                    obj.setSelectedBlock(path);
+                end
+            catch
+                % Polling must never interrupt the UI.
+            end
+        end
+
+        function updateCompatibility(obj)
+            c=obj.CompatibilityManager.snapshot();
+            parts={['MATLAB ' char(c.MATLAB)]};
+            if ~isempty(c.Simulink), parts{end+1}=['Simulink ' char(c.Simulink)]; end %#ok<AGROW>
+            if c.StateflowAvailable, parts{end+1}='Stateflow available'; else, parts{end+1}='Stateflow unavailable'; end %#ok<AGROW>
+            if c.SimulinkCoder, parts{end+1}='Simulink Coder available'; end %#ok<AGROW>
+            if smartdebugger.CompatibilityManager.hasTargetLink(), parts{end+1}='TargetLink detected'; end %#ok<AGROW>
+            obj.CompatibilityLabel.Text=strjoin(parts,' | ');
+        end
+
+        function clearDiagnostics(obj)
+            obj.DiagnosticsManager.clear();
+            obj.showDiagnostics();
+        end
+
+        function clearTransientDiagnostics(obj)
+            % Keep history during a session; the diagnostics panel is refreshed
+            % after every operation.
+        end
+
+        function handleError(obj,ME,stage)
+            obj.DiagnosticsManager.recordException(ME,stage);
+            obj.status([stage ' failed. See Diagnostics.']);
+            obj.showDiagnostics();
+        end
+
+        function status(obj,msg)
+            if isempty(obj.StatusLabel) || ~isvalid(obj.StatusLabel), return; end
+            obj.StatusLabel.Text=char(msg);
+        end
+
+        function setBusy(obj,value)
+            obj.Busy=value;
+            if isempty(obj.UIFigure) || ~isvalid(obj.UIFigure), return; end
+            if value
+                obj.UIFigure.Pointer='watch';
+            else
+                obj.UIFigure.Pointer='arrow';
+            end
+            drawnow;
+        end
     end
 end
-function y=ternary(c,a,b), if c,y=a;else,y=b;end,end
+
+function text=localFormatValue(value)
+if isempty(value)
+    text='';
+    return;
+end
+try
+    if ischar(value)
+        text=value;
+    elseif isstring(value) && isscalar(value)
+        text=char(value);
+    elseif isscalar(value)
+        text=mat2str(value,8);
+    elseif isnumeric(value) || islogical(value)
+        sz=size(value);
+        if numel(value)<=8
+            text=mat2str(value,8);
+        else
+            text=sprintf('%s %s, min=%s, max=%s',class(value),mat2str(sz), ...
+                mat2str(min(value(:)),8),mat2str(max(value(:)),8));
+        end
+    else
+        text=['<' class(value) '>'];
+    end
+catch
+    text=['<' class(value) '>'];
+end
+end
+
+function localPlot(ax,t,data,name)
+if isempty(data), return; end
+try
+    if isvector(data)
+        plot(ax,t,data,'DisplayName',name);
+    elseif isnumeric(data)
+        plot(ax,t,data(:,1),'DisplayName',name);
+    end
+catch
+end
+end
