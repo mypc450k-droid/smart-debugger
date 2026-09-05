@@ -4,26 +4,26 @@ classdef ModelManager < handle
         Model = ''
         Diagnostics
     end
-
     methods
         function obj = ModelManager(diag)
             obj.Diagnostics = diag;
         end
-
         function loadModel(obj,model)
             model = char(string(model));
-            if isempty(strtrim(model))
-                error('SmartDebugger:EmptyModel','MIL model is empty.');
-            end
+            if isempty(strtrim(model)), error('SmartDebugger:EmptyModel','MIL model is empty.'); end
             try
                 [~,root,ext] = fileparts(model);
+                % A model can be loaded in memory even when its source file is
+                % temporarily unavailable, which is common with generated/working copies.
+                if bdIsLoaded(root)
+                    obj.Model = root;
+                    return;
+                end
                 if isempty(ext)
-                    if ~bdIsLoaded(root)
-                        if exist([root '.slx'],'file') || exist([root '.mdl'],'file')
-                            load_system(root);
-                        else
-                            error('SmartDebugger:ModelNotFound','Model not found: %s',model);
-                        end
+                    if exist([root '.slx'],'file') || exist([root '.mdl'],'file')
+                        load_system(root);
+                    else
+                        error('SmartDebugger:ModelNotFound','Model not found: %s',model);
                     end
                 elseif exist(model,'file') == 2
                     load_system(model);
@@ -36,30 +36,34 @@ classdef ModelManager < handle
                 rethrow(ME);
             end
         end
-
         function path = currentSimulinkSelection(obj)
             path = '';
             try
-                if isempty(obj.Model) || ~bdIsLoaded(obj.Model), return; end
-                selected = find_system(obj.Model,'FindAll','on','Type','Block','Selected','on');
-                if ~isempty(selected)
-                    path = getfullname(selected(1));
-                    return;
-                end
+                % First ask Simulink for globally selected blocks. This makes
+                % Import work even when the app was launched before the model was opened.
                 try
                     selected = get_param(0,'SelectedBlocks');
                     if ischar(selected) && ~isempty(selected)
                         path = selected;
+                    elseif isstring(selected) && ~isempty(selected)
+                        path = char(selected(1));
                     elseif iscell(selected) && ~isempty(selected)
                         path = char(selected{1});
                     end
                 catch
                 end
+                if ~isempty(path)
+                    try, obj.Model = bdroot(path); catch, end
+                    return;
+                end
+                % Fallback for releases where SelectedBlocks is not populated globally.
+                if isempty(obj.Model) || ~bdIsLoaded(obj.Model), return; end
+                selected = find_system(obj.Model,'FindAll','on','Type','Block','Selected','on');
+                if ~isempty(selected), path = getfullname(selected(1)); end
             catch ME
                 obj.Diagnostics.recordException(ME,'Read selection');
             end
         end
-
         function info = inspectBlock(obj,path)
             info = [];
             path = char(string(path));
@@ -67,6 +71,7 @@ classdef ModelManager < handle
             try
                 root = bdroot(path);
                 if ~bdIsLoaded(root), load_system(root); end
+                obj.Model = root;
                 get_param(path,'Handle');
                 set_param(root,'SimulationCommand','update');
                 info.Path = path;
@@ -82,90 +87,52 @@ classdef ModelManager < handle
                 info.StateflowInfo = [];
                 if smartdebugger.StateflowAdapter.isAvailable()
                     sfInfo = smartdebugger.StateflowAdapter.inspect(path);
-                    if sfInfo.Supported
-                        info.IsStateflow = true;
-                        info.StateflowInfo = sfInfo;
-                    end
+                    if sfInfo.Supported, info.IsStateflow = true; info.StateflowInfo = sfInfo; end
                 end
             catch ME
                 obj.Diagnostics.recordException(ME,'Inspect block');
             end
         end
-
         function ports = portInfo(obj,path,direction) %#ok<INUSD>
             emptyPort = struct('Port',0,'Name','','Value',[],'DataType','','Dimension','', ...
                 'SampleTime','','SignalHandle',-1,'LineHandle',-1);
             ports = repmat(emptyPort,0,1);
             try
                 ph = get_param(path,'PortHandles');
-                if strcmpi(direction,'Inport')
-                    hs = ph.Inport;
-                    displayDirection = 'Input';
-                else
-                    hs = ph.Outport;
-                    displayDirection = 'Output';
-                end
-                root = bdroot(path);
-                compiled = false;
-                try
-                    feval(root,[],[],[],'compile');
-                    compiled = true;
-                catch
-                    set_param(root,'SimulationCommand','update');
-                end
+                if strcmpi(direction,'Inport'), hs = ph.Inport; displayDirection = 'Input'; else, hs = ph.Outport; displayDirection = 'Output'; end
+                root = bdroot(path); compiled = false;
+                try, feval(root,[],[],[],'compile'); compiled = true; catch, set_param(root,'SimulationCommand','update'); end
                 cleanup = onCleanup(@()obj.terminateCompile(root,compiled)); %#ok<NASGU>
-                dt = [];
-                dims = [];
-                sts = [];
-                try, dt = get_param(path,'CompiledPortDataTypes'); catch, end
-                try, dims = get_param(path,'CompiledPortDimensions'); catch, end
-                try, sts = get_param(path,'CompiledPortSampleTimes'); catch, end
-                for k = 1:numel(hs)
-                    p = emptyPort;
-                    p.Port = k;
-                    p.Name = sprintf('%s %d',displayDirection,k);
-                    p.SignalHandle = hs(k);
-                    try, p.LineHandle = get_param(hs(k),'Line'); catch, end
-                    if p.LineHandle ~= -1
-                        try, p.Name = smartdebugger.SignalNameResolver.resolve(p.LineHandle,k,displayDirection); catch, end
-                    end
+                dt=[]; dims=[]; sts=[];
+                try, dt=get_param(path,'CompiledPortDataTypes'); catch, end
+                try, dims=get_param(path,'CompiledPortDimensions'); catch, end
+                try, sts=get_param(path,'CompiledPortSampleTimes'); catch, end
+                for k=1:numel(hs)
+                    p=emptyPort; p.Port=k; p.Name=sprintf('%s %d',displayDirection,k); p.SignalHandle=hs(k);
+                    try, p.LineHandle=get_param(hs(k),'Line'); catch, end
+                    if p.LineHandle~=-1, try, p.Name=smartdebugger.SignalNameResolver.resolve(p.LineHandle,k,displayDirection); catch, end, end
                     try
-                        if strcmpi(direction,'Inport') && isstruct(dt) && isfield(dt,'Inport')
-                            p.DataType = char(dt.Inport{k});
-                        elseif strcmpi(direction,'Outport') && isstruct(dt) && isfield(dt,'Outport')
-                            p.DataType = char(dt.Outport{k});
-                        end
-                    catch
-                    end
+                        if strcmpi(direction,'Inport') && isstruct(dt) && isfield(dt,'Inport'), p.DataType=char(dt.Inport{k});
+                        elseif strcmpi(direction,'Outport') && isstruct(dt) && isfield(dt,'Outport'), p.DataType=char(dt.Outport{k}); end
+                    catch, end
                     try
-                        if strcmpi(direction,'Inport') && isstruct(dims) && isfield(dims,'Inport')
-                            p.Dimension = mat2str(dims.Inport(k,:));
-                        elseif strcmpi(direction,'Outport') && isstruct(dims) && isfield(dims,'Outport')
-                            p.Dimension = mat2str(dims.Outport(k,:));
-                        end
-                    catch
-                    end
+                        if strcmpi(direction,'Inport') && isstruct(dims) && isfield(dims,'Inport'), p.Dimension=mat2str(dims.Inport(k,:));
+                        elseif strcmpi(direction,'Outport') && isstruct(dims) && isfield(dims,'Outport'), p.Dimension=mat2str(dims.Outport(k,:)); end
+                    catch, end
                     try
-                        if strcmpi(direction,'Inport') && isstruct(sts) && isfield(sts,'Inport')
-                            p.SampleTime = mat2str(sts.Inport(k,:));
-                        elseif strcmpi(direction,'Outport') && isstruct(sts) && isfield(sts,'Outport')
-                            p.SampleTime = mat2str(sts.Outport(k,:));
-                        end
-                    catch
-                    end
-                    ports(end+1) = p; %#ok<AGROW>
+                        if strcmpi(direction,'Inport') && isstruct(sts) && isfield(sts,'Inport'), p.SampleTime=mat2str(sts.Inport(k,:));
+                        elseif strcmpi(direction,'Outport') && isstruct(sts) && isfield(sts,'Outport'), p.SampleTime=mat2str(sts.Outport(k,:)); end
+                    catch, end
+                    ports(end+1)=p; %#ok<AGROW>
                 end
             catch ME
                 obj.Diagnostics.recordException(ME,'Port inspection');
             end
         end
     end
-
     methods (Access=private)
         function terminateCompile(~,root,compiled)
-            if compiled
-                try, feval(root,[],[],[],'term'); catch, end
-            end
+            if compiled, try, feval(root,[],[],[],'term'); catch, end, end
         end
     end
 end
