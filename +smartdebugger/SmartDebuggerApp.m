@@ -527,14 +527,9 @@ classdef SmartDebuggerApp < handle
                     continue;
                 end
                 node = uitreenode(parentNode,'Text',get_param(path,'Name'),'NodeData',path);
-                try
-                    childBlocks = find_system(path,'SearchDepth',1,'Type','Block');
-                catch
-                    childBlocks = {};
-                end
-                if numel(childBlocks) > 1
-                    obj.addTreeChildren(node,path);
-                end
+                % Recurse for every block. Atomic blocks simply have no
+                % descendants, while subsystems expose their complete hierarchy.
+                obj.addTreeChildren(node,path);
             end
         end
 
