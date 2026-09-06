@@ -1,0 +1,20 @@
+name: Patch SIL
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          print('SIL patch runner started')
+          p=Path('.github/workflows/patch-sil.yml')
+          text=p.read_text()
+          print('workflow bytes', len(text))
+          PY
