@@ -29,47 +29,118 @@ classdef SimulationManager < handle
 
             tx = smartdebugger.TransactionManager();
             cleanup = onCleanup(@()tx.restore()); %#ok<NASGU>
+            inputs = [];
+            outputs = [];
+            simOut = [];
+
             try
                 root = obj.ensureModelLoaded(model,block);
                 get_param(block,'Handle');
-
-                % Do not force an explicit update here. sim() performs the
-                % required model compilation itself. This avoids compiling the
-                % same TargetLink/Simulink model twice during one debug run.
                 inputs = obj.instrumentPorts(block,'Inport',tx);
                 outputs = obj.instrumentPorts(block,'Outport',tx);
 
-                simOut = sim(root,'StopTime',stopTime, ...
-                    'SignalLogging','on','SignalLoggingName','logsout', ...
-                    'ReturnWorkspaceOutputs','on');
+                simArgs = {'SignalLogging','on', ...
+                    'SignalLoggingName','logsout', ...
+                    'ReturnWorkspaceOutputs','on'};
+                if ~obj.isAutoStopTime(stopTime)
+                    simArgs = [simArgs {'StopTime',stopTime}]; %#ok<AGROW>
+                end
+                if strcmpi(mode,'MIL')
+                    simArgs = [simArgs {'CaptureErrors','on'}]; %#ok<AGROW>
+                end
+
+                simOut = sim(root,simArgs{:});
+                result.SimulationOutput = simOut;
 
                 logs = obj.getLogs(simOut);
                 result.Inputs = obj.readLogged(logs,inputs);
                 result.Outputs = obj.readLogged(logs,outputs);
                 result.Time = obj.findCommonTime(result);
-                result.SimulationOutput = simOut;
 
                 captured = obj.countCaptured(result);
                 requested = numel(result.Inputs) + numel(result.Outputs);
-                result.Status = 'PASS';
-                if isempty(logs)
+                errorMessage = obj.simulationErrorMessage(simOut);
+
+                if ~isempty(errorMessage)
                     result.Status = 'PARTIAL';
-                    result.Message = 'Simulation completed, but logsout was not returned.';
-                    obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message,'SmartDebugger:NoLogsout');
+                    result.Message = obj.formatSimulationError(errorMessage,stopTime,root);
+                    obj.Diagnostics.record('ERROR',[mode ' simulation'],result.Message, ...
+                        'SmartDebugger:SimulationCapturedError');
+                else
+                    result.Status = 'PASS';
+                end
+
+                if isempty(logs)
+                    if isempty(errorMessage)
+                        result.Status = 'PARTIAL';
+                        result.Message = 'Simulation completed, but logsout was not returned.';
+                        obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message, ...
+                            'SmartDebugger:NoLogsout');
+                    else
+                        result.Status = 'FAILED';
+                    end
                 elseif requested > 0 && captured == 0
                     result.Status = 'PARTIAL';
-                    result.Message = ['Simulation completed but none of the selected ports produced ' ...
-                        'readable runtime series. See Diagnostics for unsupported or unconnected signals.'];
-                    obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message,'SmartDebugger:NoSelectedPortData');
+                    if isempty(result.Message)
+                        result.Message = ['Simulation completed but none of the selected ports produced ' ...
+                            'readable runtime series. See Diagnostics for unsupported or unconnected signals.'];
+                    end
+                    obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message, ...
+                        'SmartDebugger:NoSelectedPortData');
                 elseif captured < requested
-                    result.Status = 'PARTIAL';
-                    result.Message = sprintf('Simulation completed. Captured %d of %d selected ports.',captured,requested);
-                    obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message,'SmartDebugger:PartialPortData');
+                    if ~strcmp(result.Status,'FAILED')
+                        result.Status = 'PARTIAL';
+                    end
+                    suffix = sprintf(' Captured %d of %d selected ports.',captured,requested);
+                    result.Message = strtrim([result.Message suffix]);
+                    obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message, ...
+                        'SmartDebugger:PartialPortData');
                 end
             catch ME
+                result.SimulationOutput = simOut;
                 result.Message = ME.message;
                 obj.Diagnostics.recordException(ME,[mode ' simulation']);
                 rethrow(ME);
+            end
+        end
+
+        function tf = isAutoStopTime(~,stopTime)
+            s = strtrim(char(string(stopTime)));
+            tf = isempty(s) || strcmpi(s,'auto') || strcmpi(s,'auto (model)');
+        end
+
+        function message = simulationErrorMessage(~,simOut)
+            message = '';
+            if isempty(simOut)
+                return;
+            end
+            try
+                if isprop(simOut,'ErrorMessage')
+                    message = char(string(simOut.ErrorMessage));
+                end
+            catch
+            end
+        end
+
+        function message = formatSimulationError(~,errorMessage,stopTime,root)
+            message = char(string(errorMessage));
+            lowerMessage = lower(message);
+            if contains(lowerMessage,'tpt test is still running') || ...
+                    contains(lowerMessage,'stop time smaller than the length of the tpt test')
+                if isempty(strtrim(stopTime)) || strcmpi(strtrim(stopTime),'auto') || ...
+                        strcmpi(strtrim(stopTime),'auto (model)')
+                    message = [message ' Smart Debugger did not override the model StopTime. ' ...
+                        'The TPT test frame itself appears to end before the TPT test case. ' ...
+                        'Increase the test-frame/model StopTime to the TPT test-case duration.'];
+                else
+                    message = [message ' Smart Debugger explicitly overrode StopTime=' stopTime ...
+                        '. For a TPT test frame, use StopTime=auto or set it at least to the TPT test-case duration.'];
+                end
+            end
+            try
+                configured = get_param(root,'StopTime');
+                message = [message sprintf(' Model StopTime currently configured as %s.',char(string(configured)))];
+            catch
             end
         end
 
@@ -78,7 +149,9 @@ classdef SimulationManager < handle
                 root = bdroot(block);
                 if isempty(root) || ~bdIsLoaded(root)
                     [~,rootFromFile,ext] = fileparts(model);
-                    if isempty(rootFromFile), rootFromFile = model; end
+                    if isempty(rootFromFile)
+                        rootFromFile = model;
+                    end
                     if bdIsLoaded(rootFromFile)
                         root = rootFromFile;
                     else
@@ -91,19 +164,27 @@ classdef SimulationManager < handle
                     end
                 end
             catch ME
-                error('SmartDebugger:ModelLoadFailed','Unable to load/resolve simulation model: %s',ME.message);
+                error('SmartDebugger:ModelLoadFailed', ...
+                    'Unable to load/resolve simulation model: %s',ME.message);
             end
         end
 
         function logs = getLogs(~,simOut)
             logs = [];
-            if isempty(simOut), return; end
+            if isempty(simOut)
+                return;
+            end
             try
-                if isprop(simOut,'logsout'), logs = simOut.logsout; end
+                if isprop(simOut,'logsout')
+                    logs = simOut.logsout;
+                end
             catch
             end
             if isempty(logs)
-                try, logs = simOut.get('logsout'); catch, end
+                try
+                    logs = simOut.get('logsout');
+                catch
+                end
             end
         end
 
@@ -128,7 +209,11 @@ classdef SimulationManager < handle
                 p.Port = k;
                 p.SignalHandle = hs(k);
                 p.Name = sprintf('%s %d',displayDirection,k);
-                try, p.LineHandle = get_param(hs(k),'Line'); catch, p.LineHandle = -1; end
+                try
+                    p.LineHandle = get_param(hs(k),'Line');
+                catch
+                    p.LineHandle = -1;
+                end
 
                 if p.LineHandle == -1
                     ports(end+1) = p; %#ok<AGROW>
@@ -188,13 +273,19 @@ classdef SimulationManager < handle
         end
 
         function ports = readLogged(obj,logs,ports)
-            if isempty(ports), return; end
+            if isempty(ports) || isempty(logs)
+                return;
+            end
             for k = 1:numel(ports)
-                if isempty(ports(k).LogName) || isempty(logs), continue; end
+                if isempty(ports(k).LogName)
+                    continue;
+                end
                 try
                     element = obj.findLogElement(logs,ports(k).LogName);
-                    if isempty(element), error('SmartDebugger:LoggedSignalMissing', ...
-                            'Logged signal %s was not found in logsout.',ports(k).LogName); end
+                    if isempty(element)
+                        error('SmartDebugger:LoggedSignalMissing', ...
+                            'Logged signal %s was not found in logsout.',ports(k).LogName);
+                    end
                     ts = element.Values;
                     ports(k).Series = ts;
                     if isprop(ts,'Data')
@@ -239,7 +330,9 @@ classdef SimulationManager < handle
             n = 0;
             allPorts = [result.Inputs result.Outputs];
             for k = 1:numel(allPorts)
-                if ~isempty(allPorts(k).Series), n = n + 1; end
+                if ~isempty(allPorts(k).Series)
+                    n = n + 1;
+                end
             end
         end
 
@@ -258,11 +351,18 @@ classdef SimulationManager < handle
         end
 
         function value = safeGetParam(~,handle,param,defaultValue)
-            try, value = get_param(handle,param); catch, value = defaultValue; end
+            try
+                value = get_param(handle,param);
+            catch
+                value = defaultValue;
+            end
         end
 
         function value = lastSample(~,data)
-            if isempty(data), value = []; return; end
+            if isempty(data)
+                value = [];
+                return;
+            end
             n = size(data,1);
             subs = repmat({':'},1,ndims(data));
             subs{1} = n;
@@ -270,10 +370,17 @@ classdef SimulationManager < handle
         end
 
         function text = sampleTime(~,t)
-            if numel(t) < 2, text = 'single/unknown'; return; end
+            if numel(t) < 2
+                text = 'single/unknown';
+                return;
+            end
             d = diff(t);
             d = d(isfinite(d) & d > 0);
-            if isempty(d), text = 'variable'; else, text = mat2str(min(d)); end
+            if isempty(d)
+                text = 'variable';
+            else
+                text = mat2str(min(d));
+            end
         end
     end
 end
