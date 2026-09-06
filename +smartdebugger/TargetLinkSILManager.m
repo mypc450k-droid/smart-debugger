@@ -1,9 +1,8 @@
 classdef TargetLinkSILManager < handle
     %TARGETLINKSILMANAGER TargetLink-native SIL orchestration.
     %
-    % Runs the production-code SIL path through TargetLink and retrieves the
-    % resulting TargetLink Data Server simulation without modifying the MIL
-    % execution path.
+    % Runs production-code SIL through TargetLink and retrieves the resulting
+    % TargetLink Data Server simulation without modifying the MIL path.
 
     properties (SetAccess=private)
         Adapter
@@ -50,6 +49,17 @@ classdef TargetLinkSILManager < handle
                 load_system(mdl);
             end
 
+            [tlSubsystem,resolveInfo]=obj.Adapter.resolveSubsystem(model,subsystem);
+            result.ResolvedSubsystem=tlSubsystem;
+            result.MappingMethod=resolveInfo.Method;
+            result.MappingConfidence=resolveInfo.Confidence;
+            result.MappingCandidates=resolveInfo.Candidates;
+            if isempty(tlSubsystem)
+                result.Status='ERROR';
+                result.Message=resolveInfo.Message;
+                return
+            end
+
             originalStop='';
             restoreStop=false;
             try
@@ -60,17 +70,17 @@ classdef TargetLinkSILManager < handle
                 end
 
                 if caps.SetSimMode
-                    obj.Adapter.setSimulationMode(model,subsystem,'TL_CODE_HOST');
+                    obj.Adapter.setSimulationMode(model,tlSubsystem,'TL_CODE_HOST');
                 end
 
                 if caps.GenerateCode
-                    obj.Adapter.generateCode(model,subsystem);
+                    obj.Adapter.generateCode(model,tlSubsystem);
                 end
 
                 if caps.BuildHost
-                    obj.Adapter.buildHost(model,subsystem);
+                    obj.Adapter.buildHost(model,tlSubsystem);
                 elseif caps.CompileHost
-                    obj.Adapter.compileHost(model,subsystem);
+                    obj.Adapter.compileHost(model,tlSubsystem);
                 else
                     error('SmartDebugger:TargetLinkHostBuildUnavailable', ...
                         'TargetLink host build/compile API is not available.');
@@ -81,12 +91,12 @@ classdef TargetLinkSILManager < handle
                         'TargetLink tl_sim is not available in this MATLAB session.');
                 end
 
-                result.Message=obj.Adapter.simulate(model,subsystem);
+                result.Message=obj.Adapter.simulate(model,tlSubsystem);
                 result.Status='SIMULATED';
                 result.DataSource='TargetLink Data Server';
 
                 if caps.AccessLogData || caps.TLDS
-                    [data,ok,msg,method]=obj.Adapter.accessLogData(model,subsystem);
+                    [data,ok,msg,method]=obj.Adapter.accessLogData(model,tlSubsystem);
                     result.RawLogData=data;
                     result.LogDataAvailable=ok;
                     result.DataAccessMethod=method;
@@ -98,6 +108,10 @@ classdef TargetLinkSILManager < handle
                         result.Message=[result.Message ' ' msg];
                         result.RuntimeSignals=obj.normalizeLogData(data);
                         result.SignalCount=numel(result.RuntimeSignals);
+                        if result.SignalCount==0
+                            result.Status='SIMULATED_NO_DATA';
+                            result.Message=[result.Message ' The Data Server payload contains no readable runtime signal series.'];
+                        end
                     end
                 else
                     result.Status='SIMULATED_NO_DATA';
@@ -129,6 +143,10 @@ classdef TargetLinkSILManager < handle
                 'ErrorReport','', ...
                 'Model',model, ...
                 'Subsystem',subsystem, ...
+                'ResolvedSubsystem','', ...
+                'MappingConfidence','NONE', ...
+                'MappingMethod','NONE', ...
+                'MappingCandidates',{{}}, ...
                 'StopTime',stopTime, ...
                 'Capabilities',struct(), ...
                 'DataSource','', ...
@@ -171,7 +189,7 @@ if istable(data)
         if isempty(time) && isnumeric(v) && isvector(v)
             time=(0:numel(v)-1).';
         end
-        if ~any(strcmp(vars{k},{'time','timestamp','timestamps'})) && (isnumeric(v) || islogical(v))
+        if ~any(strcmpi(vars{k},{'time','timestamp','timestamps'})) && (isnumeric(v) || islogical(v))
             rows(end+1)=localRow(localName(prefix,vars{k}),time,v,localName(prefix,vars{k})); %#ok<AGROW>
         end
     end
@@ -219,9 +237,7 @@ for k=1:numel(names)
         return
     end
 end
-if isempty(t)
-    t=(0:n-1).';
-end
+if isempty(t), t=(0:n-1).'; end
 end
 
 function r=localRow(name,time,data,path)
@@ -235,11 +251,7 @@ end
 
 function out=localName(prefix,name)
 name=char(string(name));
-if isempty(prefix)
-    out=name;
-else
-    out=[prefix '.' name];
-end
+if isempty(prefix), out=name; else, out=[prefix '.' name]; end
 end
 
 function name=localModelName(model)
