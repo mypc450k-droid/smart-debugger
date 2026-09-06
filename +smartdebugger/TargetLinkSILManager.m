@@ -44,7 +44,8 @@ classdef TargetLinkSILManager < handle
                     result.CodeGenerationMode='REUSE_EXISTING';
                 end
                 if ~caps.Sim, error('SmartDebugger:TargetLinkSimulationUnavailable','TargetLink tl_sim is not available in this MATLAB session.'); end
-                result.Message=obj.Adapter.simulate(tlModel,tlSubsystem); result.Status='SIMULATED'; result.DataSource='TargetLink Data Server';
+                result.Message=obj.runTargetLinkSimulation(tlModel,tlSubsystem);
+                result.Status='SIMULATED'; result.DataSource='TargetLink Data Server';
                 if caps.AccessLogData || caps.TLDS
                     [data,ok,msg,method]=obj.Adapter.accessLogData(tlModel,tlSubsystem); result.RawLogData=data; result.LogDataAvailable=ok; result.DataAccessMethod=method;
                     if ~ok
@@ -71,6 +72,33 @@ classdef TargetLinkSILManager < handle
                 'DataSource','','DataAccessMethod','','RawLogData',[],'LogDataAvailable',false,'RuntimeSignals',struct([]),'SignalCount',0);
         end
         function rows=normalizeLogData(~,data), rows=localNormalize(data,''); end
+        function message=runTargetLinkSimulation(obj,model,subsystem)
+            % TargetLink documents the Model property as optional for its
+            % automation commands. If an explicitly supplied Model is rejected
+            % as not-open even though Simulink has the model open, retry using
+            % the currently open model context. This is important for releases
+            % that resolve tl_sim against the active TargetLink/Simulink model.
+            try
+                message=obj.Adapter.simulate(model,subsystem);
+                return
+            catch ME
+                if ~localLooksLikeModelOpenError(ME)
+                    rethrow(ME);
+                end
+                if ~bdIsLoaded(model), load_system(model); end
+                open_system(model);
+                drawnow;
+                try
+                    feval('tl_sim','TlSubsystems',subsystem);
+                    message='TargetLink SIL simulation completed using the active open-model context.';
+                catch ME2
+                    error('SmartDebugger:TargetLinkSimulationFailed', ...
+                        ['TargetLink tl_sim failed with both explicit Model and active-model invocation. ' ...
+                         'Model="%s", TlSubsystems="%s": %s'], ...
+                        model,subsystem,ME2.message);
+                end
+            end
+        end
     end
 end
 
@@ -162,4 +190,8 @@ function out=localName(prefix,name), if isempty(prefix), out=char(string(name));
 function name=localModelName(model), model=char(string(model)); [~,name,ext]=fileparts(model); if isempty(ext), name=model; end, end
 function tf=localPathIsAncestorOrEqual(candidate,requested)
 candidate=char(string(candidate)); requested=char(string(requested)); tf=strcmp(candidate,requested) || startsWith([requested '/'],[candidate '/']);
+end
+function tf=localLooksLikeModelOpenError(ME)
+msg=lower(ME.message);
+tf=contains(msg,'model to be simulated must be opened') || contains(msg,'model must be opened') || contains(msg,'model is not open') || contains(msg,'model must be open');
 end
