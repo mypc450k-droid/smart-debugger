@@ -356,51 +356,43 @@ classdef SimulationManager < handle
         end
 
         function leaves = expandBusValues(obj, parent, values)
+            % Signal logging stores a bus as a structure of timeseries objects.
+            % Unlike a scalar signal, the Values property itself is the structure,
+            % so there is no .Data property at this level.
             leaves = obj.emptyPorts();
-            data = [];
-            try
-                data = values.Data;
-            catch
-                return;
-            end
 
-            if ~isstruct(data)
-                return;
-            end
-
-            fields = fieldnames(data);
-            for k = 1:numel(fields)
-                child = data.(fields{k});
-                childLeaves = obj.collectBusLeaf(parent, child, fields{k});
-                if ~isempty(childLeaves)
-                    leaves = [leaves; childLeaves]; %#ok<AGROW>
+            if isstruct(values)
+                data = values;
+            else
+                data = [];
+                try
+                    data = values.Data;
+                catch
+                    return;
+                end
+                if ~isstruct(data)
+                    return;
                 end
             end
 
+            leaves = obj.collectBusStruct(parent, data, '');
+
             if ~isempty(leaves)
                 obj.Diagnostics.record('INFO', 'Bus expansion', ...
-                    sprintf('%s expanded into %d leaf signals.', ...
+                    sprintf('%s expanded into %d leaf signals and all leaves were captured.', ...
                     parent.Name, numel(leaves)), 'SmartDebugger:BusExpansion');
             end
         end
 
-        function leaves = collectBusLeaf(obj, parent, value, path)
+        function leaves = collectBusStruct(obj, parent, value, prefix)
             leaves = obj.emptyPorts();
 
             if obj.isTimeSeriesLike(value)
-                p = parent;
-                p.Name = [parent.Name '.' path];
-                p.LogName = [parent.LogName '.' path];
-                p.Series = value;
-                try
-                    data = value.Data;
-                    p.Value = obj.lastSample(data);
-                    p.DataType = class(data);
-                    p.Dimension = mat2str(size(data));
-                    p.SampleTime = obj.formatSampleTime(value.Time);
-                    obj.logRuntimeInfo(p.Name, value);
-                catch
+                path = strtrim(prefix);
+                if isempty(path)
+                    return;
                 end
+                p = obj.makeBusLeaf(parent, value, path);
                 leaves = p;
                 return;
             end
@@ -408,12 +400,37 @@ classdef SimulationManager < handle
             if isstruct(value)
                 fields = fieldnames(value);
                 for k = 1:numel(fields)
-                    childLeaves = obj.collectBusLeaf(parent, ...
-                        value.(fields{k}), [path '.' fields{k}]);
+                    fieldName = fields{k};
+                    if isempty(prefix)
+                        childPath = fieldName;
+                    else
+                        childPath = [prefix '.' fieldName];
+                    end
+
+                    child = value.(fieldName);
+                    childLeaves = obj.collectBusStruct(parent, child, childPath);
                     if ~isempty(childLeaves)
                         leaves = [leaves; childLeaves]; %#ok<AGROW>
                     end
                 end
+            end
+        end
+
+        function p = makeBusLeaf(obj, parent, value, path)
+            p = parent;
+            p.Name = [parent.Name '.' path];
+            p.LogName = [parent.LogName '.' path];
+            p.Series = value;
+
+            try
+                data = value.Data;
+                p.Value = obj.lastSample(data);
+                p.DataType = class(data);
+                p.Dimension = mat2str(size(data));
+                p.SampleTime = obj.formatSampleTime(value.Time);
+                obj.logRuntimeInfo(p.Name, value);
+            catch ME
+                obj.Diagnostics.recordException(ME, ['Read bus leaf ' p.Name]);
             end
         end
 
