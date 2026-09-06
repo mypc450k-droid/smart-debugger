@@ -68,8 +68,12 @@ classdef ModelManager < handle
             end
         end
         function ports=portInfo(obj,path,direction) %#ok<INUSD>
-            e=struct('Port',0,'Name','','Value',[],'DataType','','Dimension','','SampleTime','',... 
-                'SignalHandle',-1,'LineHandle',-1);
+            % Keep the inspected-port schema identical to the runtime-port
+            % schema used by SmartDebuggerApp. This prevents a later
+            % subscripted structure assignment from changing the field set
+            % after the struct array has been created.
+            e=struct('Port',0,'Name','','LogName','','Value',[],'DataType','','Dimension','', ...
+                'SampleTime','','Series',[],'LineHandle',-1,'SignalHandle',-1,'LoggingHandle',[]);
             ports=repmat(e,0,1);
             ph=get_param(path,'PortHandles');
             if strcmpi(direction,'Inport'), hs=ph.Inport; label='Input'; else, hs=ph.Outport; label='Output'; end
