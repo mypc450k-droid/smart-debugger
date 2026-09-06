@@ -164,9 +164,6 @@ classdef TargetLinkAdapter < handle
             try
                 feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
             catch ME
-                % TargetLink checks the Simulink model window itself. A model
-                % can be loaded without having its editor window open, so retry
-                % once after explicitly opening the root model.
                 if localLooksLikeModelOpenError(ME)
                     localEnsureModelOpen(model);
                     try
@@ -245,8 +242,6 @@ classdef TargetLinkAdapter < handle
             model=localModelName(model);
             localEnsureModelOpen(model);
             try
-                % tl_sim is an action-style TargetLink command in supported releases
-                % and must not be called with an output argument.
                 feval('tl_sim','Model',model,'TlSubsystems',subsystem);
             catch ME
                 if localLooksLikeModelOpenError(ME)
@@ -343,12 +338,21 @@ model=localModelName(model);
 if ~bdIsLoaded(model)
     load_system(model);
 end
-% TargetLink distinguishes a loaded model from an opened model window.
-% Always explicitly open the root model before calling TargetLink automation.
 open_system(model);
+% TargetLink distinguishes a loaded model from the active/current Simulink
+% system. Explicitly establish the current root model before invoking any
+% TargetLink automation command.
+try
+    set_param(0,'CurrentSystem',model);
+catch ME
+    % Some MATLAB releases expose CurrentSystem only through gcs/current
+    % editor state. Do not make SIL fail solely because this optional context
+    % property is unavailable.
+    if ~contains(lower(ME.message),'current') && ~contains(lower(ME.message),'unknown parameter')
+        rethrow(ME);
+    end
+end
 drawnow;
-% Do not force a compile/update here. That would alter the stable MIL path and
-% is unnecessary for the TargetLink API's open-model requirement.
 if ~bdIsLoaded(model)
     error('SmartDebugger:TargetLinkModelNotLoaded', ...
         'TargetLink model "%s" is still not loaded after open_system.',model);
