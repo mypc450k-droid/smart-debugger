@@ -73,9 +73,7 @@ classdef TargetLinkAdapter < handle
             end
 
             mdl=localModelName(model);
-            if ~bdIsLoaded(mdl)
-                try, load_system(mdl); catch, end
-            end
+            localEnsureModelOpen(mdl);
 
             % If the caller already supplied a simple TargetLink subsystem name,
             % keep it. Do not require the subsystem to be a Simulink block path.
@@ -88,9 +86,6 @@ classdef TargetLinkAdapter < handle
                 return
             end
 
-            % Walk from the selected/deep path upward. The nearest ancestor for
-            % which tl_get accepts BlockDataStruct is the strongest TargetLink
-            % object-level match and yields its local block name.
             candidates=localAncestorPaths(requested);
             info.Candidates=candidates;
             for k=1:numel(candidates)
@@ -117,9 +112,6 @@ classdef TargetLinkAdapter < handle
                 end
             end
 
-            % A second, read-only discovery pass uses the installed TargetLink
-            % block enumerator. This is important for releases where tl_get does
-            % not expose BlockDataStruct on the software-unit subsystem itself.
             if ~isempty(which('tl_get_blocks'))
                 try
                     hmdl=get_param(mdl,'Handle');
@@ -147,9 +139,6 @@ classdef TargetLinkAdapter < handle
                 end
             end
 
-            % Last-resort path handling: if the requested block exists, use its
-            % local name only when it is itself a subsystem. This keeps the API
-            % call compatible with TargetLink's name-based TlSubsystems option.
             try
                 h=get_param(requested,'Handle');
                 bt=get_param(h,'BlockType');
@@ -171,7 +160,28 @@ classdef TargetLinkAdapter < handle
         function setSimulationMode(model,subsystem,mode)
             if isempty(which('tl_set_sim_mode')), return; end
             model=localModelName(model);
-            feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
+            localEnsureModelOpen(model);
+            try
+                feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
+            catch ME
+                % TargetLink checks the Simulink model window itself. A model
+                % can be loaded without having its editor window open, so retry
+                % once after explicitly opening the root model.
+                if localLooksLikeModelOpenError(ME)
+                    localEnsureModelOpen(model);
+                    try
+                        feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
+                    catch ME2
+                        error('SmartDebugger:TargetLinkSetSimulationModeFailed', ...
+                            'TargetLink tl_set_sim_mode failed. Model="%s", TlSubsystems="%s", SimMode="%s": %s', ...
+                            model,subsystem,mode,ME2.message);
+                    end
+                else
+                    error('SmartDebugger:TargetLinkSetSimulationModeFailed', ...
+                        'TargetLink tl_set_sim_mode failed. Model="%s", TlSubsystems="%s", SimMode="%s": %s', ...
+                        model,subsystem,mode,ME.message);
+                end
+            end
         end
 
         function generateCode(model,subsystem)
@@ -179,18 +189,35 @@ classdef TargetLinkAdapter < handle
                 return
             end
             model=localModelName(model);
-            feval('tl_generate_code','Model',model,'TlSubsystems',subsystem);
+            localEnsureModelOpen(model);
+            try
+                feval('tl_generate_code','Model',model,'TlSubsystems',subsystem);
+            catch ME
+                error('SmartDebugger:TargetLinkGenerateCodeFailed', ...
+                    'TargetLink tl_generate_code failed. Model="%s", TlSubsystems="%s": %s', ...
+                    model,subsystem,ME.message);
+            end
         end
 
         function buildHost(model,subsystem)
             model=localModelName(model);
-            if ~isempty(which('tl_build_host'))
-                feval('tl_build_host','Model',model,'TlSubsystems',subsystem);
-            elseif ~isempty(which('tl_compile_host'))
-                feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
-            else
-                error('SmartDebugger:TargetLinkHostBuildUnavailable', ...
-                    'No TargetLink host-build API is available.');
+            localEnsureModelOpen(model);
+            try
+                if ~isempty(which('tl_build_host'))
+                    feval('tl_build_host','Model',model,'TlSubsystems',subsystem);
+                elseif ~isempty(which('tl_compile_host'))
+                    feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
+                else
+                    error('SmartDebugger:TargetLinkHostBuildUnavailable', ...
+                        'No TargetLink host-build API is available.');
+                end
+            catch ME
+                if startsWith(ME.identifier,'SmartDebugger:')
+                    rethrow(ME);
+                end
+                error('SmartDebugger:TargetLinkHostBuildFailed', ...
+                    'TargetLink host build failed. Model="%s", TlSubsystems="%s": %s', ...
+                    model,subsystem,ME.message);
             end
         end
 
@@ -200,7 +227,14 @@ classdef TargetLinkAdapter < handle
                     'TargetLink tl_compile_host is not available.');
             end
             model=localModelName(model);
-            feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
+            localEnsureModelOpen(model);
+            try
+                feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
+            catch ME
+                error('SmartDebugger:TargetLinkHostCompileFailed', ...
+                    'TargetLink tl_compile_host failed. Model="%s", TlSubsystems="%s": %s', ...
+                    model,subsystem,ME.message);
+            end
         end
 
         function message=simulate(model,subsystem)
@@ -209,9 +243,27 @@ classdef TargetLinkAdapter < handle
                     'TargetLink tl_sim is not available.');
             end
             model=localModelName(model);
-            % tl_sim is an action-style TargetLink command in supported releases
-            % and must not be called with an output argument.
-            feval('tl_sim','Model',model,'TlSubsystems',subsystem);
+            localEnsureModelOpen(model);
+            try
+                % tl_sim is an action-style TargetLink command in supported releases
+                % and must not be called with an output argument.
+                feval('tl_sim','Model',model,'TlSubsystems',subsystem);
+            catch ME
+                if localLooksLikeModelOpenError(ME)
+                    localEnsureModelOpen(model);
+                    try
+                        feval('tl_sim','Model',model,'TlSubsystems',subsystem);
+                    catch ME2
+                        error('SmartDebugger:TargetLinkSimulationFailed', ...
+                            'TargetLink tl_sim failed after reopening the model. Model="%s", TlSubsystems="%s": %s', ...
+                            model,subsystem,ME2.message);
+                    end
+                else
+                    error('SmartDebugger:TargetLinkSimulationFailed', ...
+                        'TargetLink tl_sim failed. Model="%s", TlSubsystems="%s": %s', ...
+                        model,subsystem,ME.message);
+                end
+            end
             message='TargetLink SIL simulation completed.';
         end
 
@@ -284,6 +336,31 @@ function name=localModelName(model)
 model=char(string(model));
 [~,name,ext]=fileparts(model);
 if isempty(ext), name=model; end
+end
+
+function localEnsureModelOpen(model)
+model=localModelName(model);
+if ~bdIsLoaded(model)
+    load_system(model);
+end
+% TargetLink distinguishes a loaded model from an opened model window.
+% Always explicitly open the root model before calling TargetLink automation.
+open_system(model);
+drawnow;
+% Do not force a compile/update here. That would alter the stable MIL path and
+% is unnecessary for the TargetLink API's open-model requirement.
+if ~bdIsLoaded(model)
+    error('SmartDebugger:TargetLinkModelNotLoaded', ...
+        'TargetLink model "%s" is still not loaded after open_system.',model);
+end
+end
+
+function tf=localLooksLikeModelOpenError(ME)
+msg=lower(ME.message);
+tf=contains(msg,'model to be simulated must be opened') || ...
+    contains(msg,'model must be opened') || ...
+    contains(msg,'model is not open') || ...
+    contains(msg,'model must be open');
 end
 
 function paths=localAncestorPaths(path)
