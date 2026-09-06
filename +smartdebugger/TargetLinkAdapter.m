@@ -24,7 +24,7 @@ classdef TargetLinkAdapter < handle
 
         function c=discoverCapabilities()
             names={'tl_sim','tl_access_logdata','tl_set_sim_mode','tl_build_host', ...
-                'tl_compile_host','tl_generate_code','tl_get','tl_set','tlds'};
+                'tl_compile_host','tl_generate_code','tl_get','tl_set','tlds','tl_get_blocks'};
             c=struct();
             for k=1:numel(names)
                 c.(localField(names{k}))=~isempty(which(names{k}));
@@ -41,6 +41,7 @@ classdef TargetLinkAdapter < handle
             c.GenerateCode=c.tl_generate_code;
             c.TLGet=c.tl_get;
             c.TLSet=c.tl_set;
+            c.TLGetBlocks=c.tl_get_blocks;
             c.Version=localVersion();
             c.CheckedAt=datestr(now,31);
         end
@@ -56,6 +57,117 @@ classdef TargetLinkAdapter < handle
             end
         end
 
+        function [resolved,info]=resolveSubsystem(model,requested)
+            % Resolve a TargetLink subsystem to the identifier expected by the
+            % TargetLink automation API. TargetLink accepts a subsystem name,
+            % while Data Server and Simulink commonly expose a full hierarchy.
+            model=char(string(model));
+            requested=char(string(requested));
+            resolved='';
+            info=struct('Requested',requested,'Resolved','', ...
+                'Method','NONE','Confidence','NONE','Candidates',{{}},'Message','');
+
+            if isempty(strtrim(requested))
+                info.Message='No TargetLink subsystem was supplied.';
+                return
+            end
+
+            mdl=localModelName(model);
+            if ~bdIsLoaded(mdl)
+                try, load_system(mdl); catch, end
+            end
+
+            % If the caller already supplied a simple TargetLink subsystem name,
+            % keep it. Do not require the subsystem to be a Simulink block path.
+            if ~contains(requested,'/') && ~contains(requested,'\\')
+                resolved=requested;
+                info.Resolved=resolved;
+                info.Method='USER_OR_NAME';
+                info.Confidence='HIGH';
+                info.Message='Using the supplied TargetLink subsystem name.';
+                return
+            end
+
+            % Walk from the selected/deep path upward. The nearest ancestor for
+            % which tl_get accepts BlockDataStruct is the strongest TargetLink
+            % object-level match and yields its local block name.
+            candidates=localAncestorPaths(requested);
+            info.Candidates=candidates;
+            for k=1:numel(candidates)
+                p=candidates{k};
+                try
+                    h=get_param(p,'Handle');
+                catch
+                    continue
+                end
+                if localIsTargetLinkObject(h)
+                    try
+                        nm=get_param(p,'Name');
+                    catch
+                        nm='';
+                    end
+                    if ~isempty(nm)
+                        resolved=char(string(nm));
+                        info.Resolved=resolved;
+                        info.Method='TL_GET_ANCESTOR_NAME';
+                        info.Confidence='HIGH';
+                        info.Message=['Resolved full Simulink path to TargetLink subsystem name: ' resolved];
+                        return
+                    end
+                end
+            end
+
+            % A second, read-only discovery pass uses the installed TargetLink
+            % block enumerator. This is important for releases where tl_get does
+            % not expose BlockDataStruct on the software-unit subsystem itself.
+            if ~isempty(which('tl_get_blocks'))
+                try
+                    hmdl=get_param(mdl,'Handle');
+                    [hlist,types]=feval('tl_get_blocks',hmdl,'AllInclSubsystems');
+                    for k=1:numel(hlist)
+                        try
+                            full=getfullname(hlist(k));
+                        catch
+                            continue
+                        end
+                        if localPathIsAncestorOrEqual(full,requested)
+                            try, nm=get_param(hlist(k),'Name'); catch, nm=''; end
+                            if ~isempty(nm) && localLooksLikeTLType(types,k)
+                                resolved=char(string(nm));
+                                info.Resolved=resolved;
+                                info.Method='TL_GET_BLOCKS_ANCESTOR';
+                                info.Confidence='HIGH';
+                                info.Message=['Resolved TargetLink hierarchy using tl_get_blocks: ' resolved];
+                                return
+                            end
+                        end
+                    end
+                catch ME
+                    info.Message=['tl_get_blocks discovery failed: ' ME.message];
+                end
+            end
+
+            % Last-resort path handling: if the requested block exists, use its
+            % local name only when it is itself a subsystem. This keeps the API
+            % call compatible with TargetLink's name-based TlSubsystems option.
+            try
+                h=get_param(requested,'Handle');
+                bt=get_param(h,'BlockType');
+                if strcmpi(bt,'SubSystem')
+                    nm=get_param(h,'Name');
+                    resolved=char(string(nm));
+                    info.Resolved=resolved;
+                    info.Method='SUBSYSTEM_NAME';
+                    info.Confidence='MEDIUM';
+                    info.Message='Using the selected Simulink subsystem name as TargetLink TlSubsystems identifier.';
+                    return
+                end
+            catch
+            end
+
+            info.Message='Could not resolve a TargetLink subsystem name from the supplied path. Select the TargetLink software-unit subsystem or enter its local TargetLink subsystem name.';
+        end
+
         function setSimulationMode(model,subsystem,mode)
             if isempty(which('tl_set_sim_mode')), return; end
             feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
@@ -65,8 +177,6 @@ classdef TargetLinkAdapter < handle
             if isempty(which('tl_generate_code'))
                 return
             end
-            % TargetLink automation uses property/value arguments. Keep the
-            % call isolated so a future TargetLink signature can be adapted here.
             feval('tl_generate_code','Model',model,'TlSubsystems',subsystem);
         end
 
@@ -94,23 +204,15 @@ classdef TargetLinkAdapter < handle
                 error('SmartDebugger:TargetLinkSimulationUnavailable', ...
                     'TargetLink tl_sim is not available.');
             end
-            out=feval('tl_sim','Model',model,'TlSubsystems',subsystem);
+            % tl_sim is an action-style TargetLink command in supported releases
+            % and must not be called with an output argument.
+            feval('tl_sim','Model',model,'TlSubsystems',subsystem);
             message='TargetLink SIL simulation completed.';
-            if ischar(out) || isstring(out)
-                message=char(string(out));
-            end
         end
 
         function [data,ok,message,method]=accessLogData(model,subsystem)
-            % Read the latest TargetLink Data Server simulation.
-            %
-            % dSPACE documents tl_access_logdata as the M-API for Data Server
-            % access. Its exact action signature is release-specific and is not
-            % exposed by the public material available to this project, so we do
-            % not invent one. If the installed release exposes the TLDS MATLAB
-            % bridge, its documented read/save sequence is used as a safe,
-            % read-only extraction fallback.
-            data=[]; ok=false; message=''; method=''; %#ok<INUSD>
+            %#ok<INUSD>
+            data=[]; ok=false; message=''; method='';
             if isempty(which('tl_access_logdata')) && isempty(which('tlds'))
                 message='No TargetLink Data Server access function is available.';
                 return
@@ -169,6 +271,51 @@ try
         if isfield(x,'Version'), v=x.Version; end
         if isfield(x,'Release') && ~isempty(x.Release), v=[v ' ' x.Release]; end
     end
+catch
+end
+end
+
+function name=localModelName(model)
+[~,name,ext]=fileparts(model);
+if isempty(ext), name=model; end
+end
+
+function paths=localAncestorPaths(path)
+parts=regexp(char(string(path)),'/','split');
+paths={};
+for k=numel(parts):-1:1
+    if k==1
+        p=parts{1};
+    else
+        p=strjoin(parts(1:k),'/');
+    end
+    paths{end+1}=p; %#ok<AGROW>
+end
+end
+
+function tf=localIsTargetLinkObject(h)
+tf=false;
+if isempty(which('tl_get')), return; end
+try
+    d=feval('tl_get',h,'BlockDataStruct');
+    tf=isstruct(d) && ~isempty(fieldnames(d));
+catch
+    tf=false;
+end
+end
+
+function tf=localPathIsAncestorOrEqual(candidate,requested)
+candidate=char(string(candidate));
+requested=char(string(requested));
+tf=strcmp(candidate,requested) || startsWith([requested '/'],[candidate '/']);
+end
+
+function tf=localLooksLikeTLType(types,k)
+tf=true;
+try
+    t=char(string(types{k}));
+    tl=lower(t);
+    tf=contains(tl,'targetlink') || contains(tl,'tl_') || contains(tl,'tlsim') || contains(tl,'subsystem');
 catch
 end
 end
