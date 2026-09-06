@@ -13,6 +13,7 @@ classdef SmartDebuggerApp < handle
         MILResult = []
         SILResult = []
     end
+
     properties (Access=private)
         MILModelField
         SILModelField
@@ -37,7 +38,9 @@ classdef SmartDebuggerApp < handle
         ActiveResult = []
         Busy = false
         TreeModel = ''
+        RunTargetBlock = ''
     end
+
     methods
         function obj = SmartDebuggerApp(varargin)
             obj.DiagnosticsManager = smartdebugger.DiagnosticsManager();
@@ -74,8 +77,10 @@ classdef SmartDebuggerApp < handle
                 obj.ModelManager.loadModel(model);
                 obj.MILModelField.Value = model;
                 obj.refreshModelTree();
-                obj.importSelection(false);
-                obj.status(['MIL model ready: ' model]);
+                % Do not import a global Simulink selection here. A selection
+                % can belong to another open model, which was the source of
+                % the previous "selected block changed" behavior.
+                obj.status(['MIL model ready: ' model ' | Select a block and click Import.']);
             catch ME
                 obj.handleError(ME,'Load MIL model');
             end
@@ -126,7 +131,7 @@ classdef SmartDebuggerApp < handle
                 end
                 if isempty(path)
                     if showMessage
-                        obj.status('No block selected. Select a block in the Simulink Editor, then click Import.');
+                        obj.status('No block selected. Select a Simulink block, then click Import.');
                     end
                     return;
                 end
@@ -140,7 +145,8 @@ classdef SmartDebuggerApp < handle
             path = char(string(path));
             root = bdroot(path);
             if isempty(root) || ~bdIsLoaded(root)
-                error('SmartDebugger:InvalidSelection','Selected block belongs to a model that is not loaded.');
+                error('SmartDebugger:InvalidSelection', ...
+                    'Selected block belongs to a model that is not loaded.');
             end
             obj.ModelManager.loadModel(root);
             obj.syncMILModelFromBlock(path);
@@ -196,33 +202,51 @@ classdef SmartDebuggerApp < handle
             if obj.Busy
                 return;
             end
+
+            % Freeze the exact debug target. TPT/Simulink may change the
+            % editor selection while the test frame is executing, but that
+            % must never change the target represented by this run.
+            snapshot = struct(...
+                'Block',obj.SelectedBlock, ...
+                'BlockField',char(string(obj.BlockField.Value)), ...
+                'MILModel',char(string(obj.MILModelField.Value)), ...
+                'SILBlock',obj.SelectedSILBlock, ...
+                'SILBlockField',char(string(obj.SILBlockField.Value)));
+            obj.RunTargetBlock = snapshot.Block;
+
             obj.setBusy(true);
-            cleanup = onCleanup(@()obj.setBusy(false)); %#ok<NASGU>
+            restoreSelection = onCleanup(@()obj.restoreRunSelection(snapshot)); %#ok<NASGU>
+            restoreBusy = onCleanup(@()obj.setBusy(false)); %#ok<NASGU>
+
             try
                 obj.ensureSelectedBlock();
                 obj.validateRunInputs();
                 stopTime = char(string(obj.StopTimeField.Value));
+
                 if strcmpi(obj.Mode,'MIL')
                     model = obj.resolveMILModel();
-                    block = char(obj.SelectedBlock);
+                    block = obj.RunTargetBlock;
                     obj.status(['Running MIL simulation for ' block ' ...']);
                     drawnow;
                     obj.MILResult = obj.SimulationManager.runMIL(model,block,stopTime);
                     result = obj.MILResult;
                 else
                     silModel = char(obj.SILModelField.Value);
-                    [silBlock,confidence,mapMethod,candidates] = smartdebugger.ModelMapper.mapBlock(char(obj.SelectedBlock),silModel);
+                    [silBlock,confidence,mapMethod,candidates] = ...
+                        smartdebugger.ModelMapper.mapBlock(obj.RunTargetBlock,silModel);
                     if isempty(silBlock)
                         override = char(obj.SILBlockField.Value);
                         if isempty(strtrim(override))
-                            error('SmartDebugger:SILMappingRequired','Automatic MIL-to-SIL mapping failed. Enter the SIL block path in the override field.');
+                            error('SmartDebugger:SILMappingRequired', ...
+                                'Automatic MIL-to-SIL mapping failed. Enter the SIL block path in the override field.');
                         end
                         silBlock = override;
                         confidence = 'USER_DEFINED';
                         mapMethod = 'USER_DEFINED';
                     end
                     if strcmp(confidence,'AMBIGUOUS')
-                        error('SmartDebugger:AmbiguousSILMapping','SIL mapping is ambiguous. Candidates: %s',strjoin(candidates,', '));
+                        error('SmartDebugger:AmbiguousSILMapping', ...
+                            'SIL mapping is ambiguous. Candidates: %s',strjoin(candidates,', '));
                     end
                     obj.SelectedSILBlock = silBlock;
                     obj.SILBlockField.Value = silBlock;
@@ -233,21 +257,33 @@ classdef SmartDebuggerApp < handle
                     obj.SILResult.MappingMethod = mapMethod;
                     result = obj.SILResult;
                 end
+
                 obj.ActiveResult = result;
-                obj.displayRuntimeResult(result);
-                obj.plotDefaultRuntimeTrace(result);
+                if ~isempty(result)
+                    obj.displayRuntimeResult(result);
+                    obj.plotDefaultRuntimeTrace(result);
+                end
+
                 if isfield(result,'Message') && ~isempty(result.Message)
                     obj.status([obj.Mode ' completed: ' result.Status ' | ' result.Message]);
                 else
                     obj.status([obj.Mode ' simulation completed: ' result.Status]);
                 end
             catch ME
+                % Keep the last successful runtime tables visible. Diagnostics
+                % are appended, never cleared, when a run fails.
                 obj.handleError(ME,'Debug run');
             end
         end
 
         function ensureSelectedBlock(obj)
-            path = char(string(obj.BlockField.Value));
+            path = char(string(obj.RunTargetBlock));
+            if isempty(strtrim(path))
+                path = char(string(obj.SelectedBlock));
+            end
+            if isempty(strtrim(path))
+                path = char(string(obj.BlockField.Value));
+            end
             if isempty(strtrim(path))
                 path = obj.ModelManager.currentSimulinkSelection();
             end
@@ -259,20 +295,23 @@ classdef SmartDebuggerApp < handle
             catch
                 error('SmartDebugger:InvalidBlock','Selected block is no longer valid: %s',path);
             end
-            if ~strcmp(path,obj.SelectedBlock)
-                obj.attachToBlock(path,true);
-            end
             obj.SelectedBlock = path;
             obj.BlockField.Value = path;
+            obj.RunTargetBlock = path;
         end
 
         function validateRunInputs(obj)
-            if isempty(strtrim(obj.SelectedBlock))
-                error('SmartDebugger:MissingBlock','Select a Simulink block first.');
+            if isempty(strtrim(obj.RunTargetBlock))
+                error('SmartDebugger:MissingBlock','Select and import a Simulink block first.');
             end
-            stopTime = str2double(char(obj.StopTimeField.Value));
+            stopText = strtrim(char(string(obj.StopTimeField.Value)));
+            if isempty(stopText) || strcmpi(stopText,'auto') || strcmpi(stopText,'auto (model)')
+                return;
+            end
+            stopTime = str2double(stopText);
             if ~isscalar(stopTime) || ~isfinite(stopTime) || stopTime < 0
-                error('SmartDebugger:InvalidStopTime','Stop time must be finite and nonnegative.');
+                error('SmartDebugger:InvalidStopTime', ...
+                    'Stop time must be a nonnegative number or "auto".');
             end
             if strcmpi(obj.Mode,'SIL') && isempty(strtrim(char(obj.SILModelField.Value)))
                 error('SmartDebugger:MissingSILModel','Select a SIL model first.');
@@ -280,7 +319,7 @@ classdef SmartDebuggerApp < handle
         end
 
         function model = resolveMILModel(obj)
-            root = bdroot(obj.SelectedBlock);
+            root = bdroot(obj.RunTargetBlock);
             if bdIsLoaded(root)
                 model = root;
             else
@@ -311,7 +350,9 @@ classdef SmartDebuggerApp < handle
                     if isnan(fd.Time)
                         obj.FirstDivergenceLabel.Text = 'MIL vs SIL: FAIL | Divergence detected';
                     else
-                        obj.FirstDivergenceLabel.Text = sprintf('FIRST OBSERVED DIVERGENCE: %s / Port %d at t = %.12g s',fd.Direction,fd.Port,fd.Time);
+                        obj.FirstDivergenceLabel.Text = sprintf( ...
+                            'FIRST OBSERVED DIVERGENCE: %s / Port %d at t = %.12g s', ...
+                            fd.Direction,fd.Port,fd.Time);
                     end
                 end
                 obj.status(['Comparison completed: ' report.Status]);
@@ -356,7 +397,9 @@ classdef SmartDebuggerApp < handle
 
     methods (Access=private)
         function buildUI(obj)
-            obj.UIFigure = uifigure('Name','Smart Debugger','Position',[50 40 1550 920],'CloseRequestFcn',@(~,~)obj.closeApp());
+            obj.UIFigure = uifigure('Name','Smart Debugger', ...
+                'Position',[50 40 1550 920], ...
+                'CloseRequestFcn',@(~,~)obj.closeApp());
             root = uigridlayout(obj.UIFigure,[4 3]);
             root.RowHeight = {72,'1x',250,30};
             root.ColumnWidth = {360,'1x',410};
@@ -382,12 +425,14 @@ classdef SmartDebuggerApp < handle
             obj.MILModelField = uieditfield(g,'text','Placeholder','MIL model path');
             uibutton(g,'Text','Open SIL','ButtonPushedFcn',@(~,~)obj.chooseSIL());
             obj.SILModelField = uieditfield(g,'text','Placeholder','SIL model path');
-            obj.ModeGroup = uidropdown(g,'Items',{'MIL','SIL'},'Value','MIL','ValueChangedFcn',@(s,~)obj.modeChanged(s));
+            obj.ModeGroup = uidropdown(g,'Items',{'MIL','SIL'},'Value','MIL', ...
+                'ValueChangedFcn',@(s,~)obj.modeChanged(s));
             uibutton(g,'Text','Import','ButtonPushedFcn',@(~,~)obj.refreshBlockSelection());
             uibutton(g,'Text','Inspect','ButtonPushedFcn',@(~,~)obj.inspectBlock());
             uibutton(g,'Text','Run Debug','ButtonPushedFcn',@(~,~)obj.runDebug());
             uibutton(g,'Text','Compare','ButtonPushedFcn',@(~,~)obj.compare());
-            obj.StopTimeField = uieditfield(g,'text','Value','10');
+            obj.StopTimeField = uieditfield(g,'text','Value','auto', ...
+                'Placeholder','auto = model StopTime');
             uilabel(g,'Text','Stop time');
             obj.StatusLabel = uilabel(g,'Text','Ready');
             obj.StatusLabel.Layout.Row = 2;
@@ -417,9 +462,17 @@ classdef SmartDebuggerApp < handle
             p.Layout.Column = 2;
             g = uigridlayout(p,[4 1]);
             g.RowHeight = {'1x','1x','1x',30};
-            obj.InputsTable = uitable(g,'ColumnName',{'Port','Input Signal','Current Value','Data Type','Dimension','Sample Time'},'RowName',{},'ColumnEditable',false(1,6),'CellSelectionCallback',@(s,e)obj.runtimeSelection(s,e,'Input'));
-            obj.OutputsTable = uitable(g,'ColumnName',{'Port','Output Signal','Current Value','Data Type','Dimension','Sample Time'},'RowName',{},'ColumnEditable',false(1,6),'CellSelectionCallback',@(s,e)obj.runtimeSelection(s,e,'Output'));
-            obj.ComparisonTable = uitable(g,'ColumnName',{'Direction','Port','MIL Signal','SIL Signal','Status','Max Abs Error','Max Rel Error','First Mismatch'},'RowName',{},'ColumnEditable',false(1,8));
+            obj.InputsTable = uitable(g,'ColumnName', ...
+                {'Port','Input Signal','Current Value','Data Type','Dimension','Sample Time'}, ...
+                'RowName',{},'ColumnEditable',false(1,6), ...
+                'CellSelectionCallback',@(s,e)obj.runtimeSelection(s,e,'Input'));
+            obj.OutputsTable = uitable(g,'ColumnName', ...
+                {'Port','Output Signal','Current Value','Data Type','Dimension','Sample Time'}, ...
+                'RowName',{},'ColumnEditable',false(1,6), ...
+                'CellSelectionCallback',@(s,e)obj.runtimeSelection(s,e,'Output'));
+            obj.ComparisonTable = uitable(g,'ColumnName', ...
+                {'Direction','Port','MIL Signal','SIL Signal','Status','Max Abs Error','Max Rel Error','First Mismatch'}, ...
+                'RowName',{},'ColumnEditable',false(1,8));
             obj.FirstDivergenceLabel = uilabel(g,'Text','No MIL/SIL comparison run yet','FontWeight','bold');
         end
 
@@ -505,52 +558,79 @@ classdef SmartDebuggerApp < handle
                 obj.Tree.Children = matlab.ui.container.TreeNode.empty;
                 return;
             end
+
             obj.TreeModel = root;
             obj.Tree.Children = matlab.ui.container.TreeNode.empty;
             top = uitreenode(obj.Tree,'Text',root,'NodeData',root);
             obj.addTreeChildren(top,root);
-            try
-                expand(top);
-            catch
-            end
+            obj.expandTreeNodeRecursive(top);
         end
 
         function addTreeChildren(obj,parentNode,parentPath)
             try
-                blocks = find_system(parentPath,'SearchDepth',1,'Type','Block');
+                blocks = find_system(parentPath,'SearchDepth',1,'Type','Block', ...
+                    'LookUnderMasks','all','FollowLinks','off');
             catch
-                blocks = {};
+                try
+                    blocks = find_system(parentPath,'SearchDepth',1,'Type','Block');
+                catch
+                    blocks = {};
+                end
             end
             for k = 1:numel(blocks)
                 path = blocks{k};
                 if strcmp(path,parentPath)
                     continue;
                 end
-                node = uitreenode(parentNode,'Text',get_param(path,'Name'),'NodeData',path);
-                % Recurse for every block. Atomic blocks simply have no
-                % descendants, while subsystems expose their complete hierarchy.
+                try
+                    nodeText = get_param(path,'Name');
+                catch
+                    nodeText = path;
+                end
+                node = uitreenode(parentNode,'Text',nodeText,'NodeData',path);
                 obj.addTreeChildren(node,path);
+            end
+        end
+
+        function expandTreeNodeRecursive(~,node)
+            try
+                expand(node);
+            catch
+            end
+            try
+                children = node.Children;
+                for k = 1:numel(children)
+                    % Only nodes with descendants need expansion, but expanding
+                    % atomic blocks is harmless and makes the hierarchy fully
+                    % visible when the tree is first loaded.
+                    expandTreeNodeRecursive([],children(k));
+                end
+            catch
             end
         end
 
         function treeSelectionChanged(obj,event)
             try
-                node = event.SelectedNodes;
-                if isempty(node)
+                nodes = event.SelectedNodes;
+                if isempty(nodes)
                     return;
                 end
-                path = char(string(node(1).NodeData));
+                path = char(string(nodes(1).NodeData));
                 if isempty(path)
                     return;
                 end
-                obj.attachToBlock(path,true);
+                % Tree navigation must not trigger a TargetLink compile on
+                % every click. Import/Inspect performs the expensive inspection.
+                obj.attachToBlock(path,false);
             catch ME
                 obj.handleError(ME,'Tree selection');
             end
         end
 
         function startSelectionWatcher(obj)
-            obj.SelectionTimer = timer('ExecutionMode','fixedSpacing','Period',0.75,'BusyMode','drop','TimerFcn',@(~,~)obj.pollSelection());
+            obj.SelectionTimer = timer('ExecutionMode','fixedSpacing', ...
+                'Period',0.75,'BusyMode','drop', ...
+                'TimerFcn',@(~,~)obj.pollSelection());
             start(obj.SelectionTimer);
         end
 
@@ -566,7 +646,7 @@ classdef SmartDebuggerApp < handle
                 obj.syncMILModelFromBlock(path);
                 obj.SelectedBlock = path;
                 obj.BlockField.Value = path;
-                obj.status(['Selected: ' path ' | click Import']);
+                obj.status(['Simulink selection detected: ' path ' | click Import to inspect']);
             catch
             end
         end
@@ -589,20 +669,26 @@ classdef SmartDebuggerApp < handle
         end
 
         function populateBlockInfo(obj,info)
-            lines = {
-                ['Path: ' info.Path]
-                ['Name: ' info.Name]
-                ['Block Type: ' info.BlockType]
-                ['Parent: ' info.Parent]
-                ['Mask: ' info.MaskType]
-                ['Library: ' info.LibraryLink]
-            };
+            lines = { ...
+                ['Path: ' info.Path] ...
+                ['Name: ' info.Name] ...
+                ['Block Type: ' info.BlockType] ...
+                ['Parent: ' info.Parent] ...
+                ['Mask: ' info.MaskType] ...
+                ['Library: ' info.LibraryLink]};
             obj.BlockInfoArea.Value = lines;
         end
 
         function displayRuntimeResult(obj,result)
-            obj.InputsTable.Data = obj.runtimeTable(result.Inputs);
-            obj.OutputsTable.Data = obj.runtimeTable(result.Outputs);
+            % Never clear diagnostics or successful runtime data merely because
+            % a new run is starting. A failed TPT run can still return partial
+            % SimulationOutput when CaptureErrors is enabled for MIL.
+            if isfield(result,'Inputs') && ~isempty(result.Inputs)
+                obj.InputsTable.Data = obj.runtimeTable(result.Inputs);
+            end
+            if isfield(result,'Outputs') && ~isempty(result.Outputs)
+                obj.OutputsTable.Data = obj.runtimeTable(result.Outputs);
+            end
             obj.showDiagnostics();
         end
 
@@ -621,18 +707,24 @@ classdef SmartDebuggerApp < handle
         function plotDefaultRuntimeTrace(obj,result)
             cla(obj.PlotAxes);
             allPorts = [result.Inputs result.Outputs];
+            plotted = false;
             for k = 1:numel(allPorts)
                 try
                     if ~isempty(allPorts(k).Series)
                         ts = allPorts(k).Series;
                         plot(obj.PlotAxes,ts.Time,ts.Data,'DisplayName',allPorts(k).Name);
                         hold(obj.PlotAxes,'on');
+                        plotted = true;
                     end
                 catch
                 end
             end
             hold(obj.PlotAxes,'off');
-            legend(obj.PlotAxes,'show','Location','best');
+            if plotted
+                legend(obj.PlotAxes,'show','Location','best');
+            else
+                legend(obj.PlotAxes,'off');
+            end
         end
 
         function plotComparison(obj,report)
@@ -647,7 +739,7 @@ classdef SmartDebuggerApp < handle
             end
         end
 
-        function runtimeSelection(obj,source,event,direction)
+        function runtimeSelection(obj,~,event,direction)
             try
                 if isempty(event.Indices)
                     return;
@@ -676,7 +768,9 @@ classdef SmartDebuggerApp < handle
                 if c.TargetLinkAvailable
                     targetLink = 'yes';
                 end
-                obj.CompatibilityLabel.Text = sprintf('MATLAB %s | Simulink %s | TargetLink: %s',c.MATLAB,c.Simulink,targetLink);
+                obj.CompatibilityLabel.Text = sprintf( ...
+                    'MATLAB %s | Simulink %s | TargetLink: %s', ...
+                    c.MATLAB,c.Simulink,targetLink);
             catch ME
                 obj.CompatibilityLabel.Text = 'Compatibility check failed';
                 obj.DiagnosticsManager.recordException(ME,'Compatibility');
@@ -718,22 +812,15 @@ classdef SmartDebuggerApp < handle
             end
         end
 
-        function text = formatValue(~,value)
-            if isempty(value)
-                text = '';
-                return;
-            end
-            if ischar(value)
-                text = value;
-                return;
-            end
+        function restoreRunSelection(obj,snapshot)
             try
-                text = mat2str(value);
-                if numel(text) > 120
-                    text = [text(1:117) '...'];
-                end
+                obj.SelectedBlock = snapshot.Block;
+                obj.BlockField.Value = snapshot.BlockField;
+                obj.MILModelField.Value = snapshot.MILModel;
+                obj.SelectedSILBlock = snapshot.SILBlock;
+                obj.SILBlockField.Value = snapshot.SILBlockField;
+                obj.RunTargetBlock = snapshot.Block;
             catch
-                text = class(value);
             end
         end
     end
