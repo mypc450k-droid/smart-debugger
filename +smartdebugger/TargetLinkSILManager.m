@@ -20,6 +20,8 @@ classdef TargetLinkSILManager < handle
             if isempty(subsystem), result.Status='ERROR'; result.Message='A TargetLink software unit is required for SIL.'; return; end
             mdl=localModelName(model); tlModel=mdl;
             if ~bdIsLoaded(mdl), load_system(mdl); end; open_system(mdl);
+            try, set_param(0,'CurrentSystem',mdl); catch, end
+            drawnow;
             % Prefer TargetLink Data Server software-unit metadata when it
             % contains an ancestor of the selected deep Simulink path. This
             % avoids mistaking an ordinary internal subsystem such as
@@ -73,11 +75,11 @@ classdef TargetLinkSILManager < handle
         end
         function rows=normalizeLogData(~,data), rows=localNormalize(data,''); end
         function message=runTargetLinkSimulation(obj,model,subsystem)
-            % TargetLink documents the Model property as optional for its
-            % automation commands. If an explicitly supplied Model is rejected
-            % as not-open even though Simulink has the model open, retry using
-            % the currently open model context. This is important for releases
-            % that resolve tl_sim against the active TargetLink/Simulink model.
+            % TargetLink requires the model to be an opened/current Simulink
+            % system in some releases. The adapter establishes this context.
+            % Keep a single release-tolerant fallback here for releases where
+            % tl_sim rejects an explicit Model property but accepts the active
+            % current-model context.
             try
                 message=obj.Adapter.simulate(model,subsystem);
                 return
@@ -87,10 +89,11 @@ classdef TargetLinkSILManager < handle
                 end
                 if ~bdIsLoaded(model), load_system(model); end
                 open_system(model);
+                try, set_param(0,'CurrentSystem',model); catch, end
                 drawnow;
                 try
                     feval('tl_sim','TlSubsystems',subsystem);
-                    message='TargetLink SIL simulation completed using the active open-model context.';
+                    message='TargetLink SIL simulation completed using the active current-model context.';
                 catch ME2
                     error('SmartDebugger:TargetLinkSimulationFailed', ...
                         ['TargetLink tl_sim failed with both explicit Model and active-model invocation. ' ...
