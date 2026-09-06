@@ -18,7 +18,8 @@ classdef TargetLinkSILManager < handle
             if ~caps.TargetLinkDetected, result.Status='ERROR'; result.Message='TargetLink was not detected in the current MATLAB session.'; return; end
             if isempty(model), result.Status='ERROR'; result.Message='A TargetLink model/frame is required for SIL.'; return; end
             if isempty(subsystem), result.Status='ERROR'; result.Message='A TargetLink software unit is required for SIL.'; return; end
-            mdl=localModelName(model); if ~bdIsLoaded(mdl), load_system(mdl); end; open_system(mdl);
+            mdl=localModelName(model); tlModel=mdl;
+            if ~bdIsLoaded(mdl), load_system(mdl); end; open_system(mdl);
             % Prefer TargetLink Data Server software-unit metadata when it
             % contains an ancestor of the selected deep Simulink path. This
             % avoids mistaking an ordinary internal subsystem such as
@@ -32,18 +33,20 @@ classdef TargetLinkSILManager < handle
             originalStop=''; restoreStop=false;
             try
                 if ~strcmpi(stopTime,'auto'), originalStop=get_param(mdl,'StopTime'); set_param(mdl,'StopTime',stopTime); restoreStop=true; end
-                if caps.SetSimMode, obj.Adapter.setSimulationMode(model,tlSubsystem,'TL_CODE_HOST'); end
+                if caps.SetSimMode
+                    obj.Adapter.setSimulationMode(tlModel,tlSubsystem,'TL_CODE_HOST');
+                end
                 if regenerate
                     result.CodeGenerationMode='REGENERATE';
-                    if caps.GenerateCode, obj.Adapter.generateCode(model,tlSubsystem); end
-                    if caps.BuildHost, obj.Adapter.buildHost(model,tlSubsystem); elseif caps.CompileHost, obj.Adapter.compileHost(model,tlSubsystem); else, error('SmartDebugger:TargetLinkHostBuildUnavailable','TargetLink host build/compile API is not available.'); end
+                    if caps.GenerateCode, obj.Adapter.generateCode(tlModel,tlSubsystem); end
+                    if caps.BuildHost, obj.Adapter.buildHost(tlModel,tlSubsystem); elseif caps.CompileHost, obj.Adapter.compileHost(tlModel,tlSubsystem); else, error('SmartDebugger:TargetLinkHostBuildUnavailable','TargetLink host build/compile API is not available.'); end
                 else
                     result.CodeGenerationMode='REUSE_EXISTING';
                 end
                 if ~caps.Sim, error('SmartDebugger:TargetLinkSimulationUnavailable','TargetLink tl_sim is not available in this MATLAB session.'); end
-                result.Message=obj.Adapter.simulate(model,tlSubsystem); result.Status='SIMULATED'; result.DataSource='TargetLink Data Server';
+                result.Message=obj.Adapter.simulate(tlModel,tlSubsystem); result.Status='SIMULATED'; result.DataSource='TargetLink Data Server';
                 if caps.AccessLogData || caps.TLDS
-                    [data,ok,msg,method]=obj.Adapter.accessLogData(model,tlSubsystem); result.RawLogData=data; result.LogDataAvailable=ok; result.DataAccessMethod=method;
+                    [data,ok,msg,method]=obj.Adapter.accessLogData(tlModel,tlSubsystem); result.RawLogData=data; result.LogDataAvailable=ok; result.DataAccessMethod=method;
                     if ~ok
                         result.Status='SIMULATED_NO_DATA'; result.Message=[result.Message ' Runtime data extraction failed: ' msg];
                     else
@@ -156,7 +159,7 @@ t=[]; names=fieldnames(s); for k=1:numel(names), name=names{k}; if strcmp(name,s
 end
 function r=localRow(name,time,data,path), r=struct('Name',char(string(name)),'Time',time,'Data',data,'DataType',class(data),'Dimension',size(data),'SourcePath',char(string(path))); end
 function out=localName(prefix,name), if isempty(prefix), out=char(string(name)); else, out=[prefix '.' char(string(name))]; end, end
-function name=localModelName(model), [~,name,ext]=fileparts(model); if isempty(ext), name=model; end, end
+function name=localModelName(model), model=char(string(model)); [~,name,ext]=fileparts(model); if isempty(ext), name=model; end, end
 function tf=localPathIsAncestorOrEqual(candidate,requested)
 candidate=char(string(candidate)); requested=char(string(requested)); tf=strcmp(candidate,requested) || startsWith([requested '/'],[candidate '/']);
 end
