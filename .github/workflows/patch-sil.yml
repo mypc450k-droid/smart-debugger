@@ -6,15 +6,185 @@ permissions:
   contents: write
 jobs:
   patch:
+    if: github.event.head_commit.message != 'Fix TargetLink SIL GUI to use native TargetLink execution'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Patch
+        with:
+          fetch-depth: 0
+      - name: Apply native TargetLink SIL GUI patch
         run: |
           python - <<'PY'
           from pathlib import Path
-          print('SIL patch runner started')
-          p=Path('.github/workflows/patch-sil.yml')
-          print('workflow bytes', len(p.read_text()))
+
+          app=Path('+smartdebugger/SmartDebuggerApp.m')
+          text=app.read_text(encoding='utf-8')
+          old='''                else
+                    silModel=char(string(obj.SILModelField.Value));
+                    [silBlock,confidence,mapMethod,candidates]=smartdebugger.ModelMapper.mapBlock(obj.RunTargetBlock,silModel);
+                    if isempty(silBlock)
+                        override=char(string(obj.SILBlockField.Value));
+                        if isempty(strtrim(override))
+                            error('SmartDebugger:SILMappingRequired','Automatic MIL-to-SIL mapping failed. Enter a SIL block override.');
+                        end
+                        silBlock=override; confidence='USER_DEFINED'; mapMethod='USER_DEFINED';
+                    end
+                    if strcmpi(confidence,'AMBIGUOUS')
+                        error('SmartDebugger:AmbiguousSILMapping','SIL mapping is ambiguous. Candidates: %s',strjoin(candidates,', '));
+                    end
+                    obj.SelectedSILBlock=silBlock;
+                    obj.SILBlockField.Value=silBlock;
+                    obj.status(['Running SIL: ' silBlock]);
+                    drawnow;
+                    runResult=obj.SimulationManager.runSIL(silModel,silBlock,stopTime);
+                    runResult.MappingConfidence=confidence;
+                    runResult.MappingMethod=mapMethod;
+                    obj.SILResult=runResult;
+                end
+                obj.ActiveResult=runResult;'''
+          new='''                else
+                    silModel=char(string(obj.SILModelField.Value));
+                    if isempty(strtrim(silModel))
+                        error('SmartDebugger:SILModelRequired','A TargetLink/SIL model is required for SIL.');
+                    end
+                    % TargetLink SIL uses native TargetLink automation/Data Server.
+                    % Do not route TargetLink models through generic Simulink logsout.
+                    silBlock=obj.RunTargetBlock;
+                    override=char(string(obj.SILBlockField.Value));
+                    if ~isempty(strtrim(override))
+                        silBlock=override;
+                    end
+                    obj.SelectedSILBlock=silBlock;
+                    obj.SILBlockField.Value=silBlock;
+                    obj.status(['Running TargetLink SIL: ' silBlock]);
+                    drawnow;
+                    tlManager=smartdebugger.TargetLinkSILManager();
+                    runResult=tlManager.run(silModel,silBlock,stopTime,false);
+                    obj.SILResult=runResult;
+                end
+                obj.ActiveResult=runResult;'''
+          if old not in text:
+              raise SystemExit('SmartDebuggerApp SIL block not found')
+          app.write_text(text.replace(old,new,1),encoding='utf-8')
+
+          mgr=Path('+smartdebugger/TargetLinkSILManager.m')
+          text=mgr.read_text(encoding='utf-8')
+          marker='result.SignalCount=numel(result.RuntimeSignals);'
+          if marker not in text:
+              raise SystemExit('TargetLinkSILManager runtime marker not found')
+          text=text.replace(marker,marker+' result=localAttachGuiRuntime(result,subsystem);',1)
+          old_empty="'DataAccessMethod','','RawLogData',[],'LogDataAvailable',false,'RuntimeSignals',struct([]),'SignalCount',0);"
+          new_empty="'DataAccessMethod','','RawLogData',[],'LogDataAvailable',false,'RuntimeSignals',struct([]),'SignalCount',0,'Mode','SIL','Block',subsystem,'Time',[],'Inputs',localEmptyPorts(),'Outputs',localEmptyPorts(),'SimulationOutput',[]);"
+          if old_empty not in text:
+              raise SystemExit('TargetLinkSILManager empty result marker not found')
+          text=text.replace(old_empty,new_empty,1)
+          if 'function result=localAttachGuiRuntime' not in text:
+              text += r'''
+
+function result=localAttachGuiRuntime(result,requested)
+result.Mode='SIL';
+result.Block=char(string(requested));
+result.Time=localFirstRuntimeTime(result.RuntimeSignals);
+portsIn=localEmptyPorts();
+portsOut=localEmptyPorts();
+try
+    ph=get_param(requested,'PortHandles');
+    inNames=localPortNames(ph.Inport,'Input');
+    outNames=localPortNames(ph.Outport,'Output');
+catch
+    inNames={}; outNames={};
+end
+used=false(1,numel(result.RuntimeSignals));
+for k=1:numel(inNames)
+    [idx,used]=localFindRuntime(result.RuntimeSignals,inNames{k},used);
+    if idx>0, portsIn(end+1)=localRuntimePort(result.RuntimeSignals(idx),k,inNames{k}); end %#ok<AGROW>
+end
+for k=1:numel(outNames)
+    [idx,used]=localFindRuntime(result.RuntimeSignals,outNames{k},used);
+    if idx>0, portsOut(end+1)=localRuntimePort(result.RuntimeSignals(idx),k,outNames{k}); end %#ok<AGROW>
+end
+nextPort=numel(portsOut)+1;
+for k=1:numel(result.RuntimeSignals)
+    if used(k), continue; end
+    portsOut(end+1)=localRuntimePort(result.RuntimeSignals(k),nextPort,result.RuntimeSignals(k).Name); %#ok<AGROW>
+    nextPort=nextPort+1;
+end
+result.Inputs=portsIn;
+result.Outputs=portsOut;
+end
+
+function names=localPortNames(handles,direction)
+names={};
+for k=1:numel(handles)
+    name='';
+    try
+        line=get_param(handles(k),'Line');
+        if ~isempty(line) && line~=-1, name=smartdebugger.SignalNameResolver.resolve(line,k,direction); end
+    catch
+    end
+    if isempty(name), name=sprintf('%s %d',direction,k); end
+    names{end+1}=char(string(name)); %#ok<AGROW>
+end
+end
+
+function [idx,used]=localFindRuntime(rows,target,used)
+idx=0; target=lower(strtrim(char(string(target))));
+if isempty(target), return; end
+best=0; bestScore=-inf;
+for k=1:numel(rows)
+    if used(k), continue; end
+    name=lower(strtrim(char(string(rows(k).Name)))); score=-inf;
+    if strcmp(name,target), score=100; end
+    if endsWith(name,['.' target]), score=max(score,90); end
+    if endsWith(name,['/' target]), score=max(score,80); end
+    if contains(name,target), score=max(score,50); end
+    if score>bestScore, bestScore=score; best=k; end
+end
+if best>0 && bestScore>=50, idx=best; used(best)=true; end
+end
+
+function p=localRuntimePort(r,port,name)
+p=localEmptyPort();
+p.Port=port; p.Name=char(string(name)); p.LogName=char(string(r.Name));
+p.Value=localLastSample(r.Data); p.DataType=char(string(r.DataType));
+p.Dimension=mat2str(r.Dimension); p.SampleTime=localSampleTime(r.Time);
+try, p.Series=timeseries(r.Data,r.Time); catch, p.Series=[]; end
+end
+
+function v=localLastSample(d)
+if isempty(d), v=[]; return; end
+try, if isvector(d), v=d(end); else, v=d(end,:); end; catch, v=d; end
+end
+
+function s=localSampleTime(t)
+if isempty(t), s=''; return; end
+try
+    if numel(t)<2, s=sprintf('%d samples',numel(t)); return; end
+    dt=diff(t(:)); dt=dt(isfinite(dt));
+    if isempty(dt), s=sprintf('%d samples',numel(t)); else, s=sprintf('%d samples / dt=%g s',numel(t),median(dt)); end
+catch
+    s='';
+end
+end
+
+function t=localFirstRuntimeTime(rows)
+t=[]; for k=1:numel(rows), if ~isempty(rows(k).Time), t=rows(k).Time; return; end, end
+end
+
+function ports=localEmptyPorts(), ports=repmat(localEmptyPort(),0,1); end
+function p=localEmptyPort()
+p=struct('Port',0,'Name','','LogName','','Value',[],'DataType','','Dimension','','SampleTime','','Series',[], ...
+    'LineHandle',-1,'SignalHandle',-1,'LoggingHandle',-1);
+end
+'''
+          mgr.write_text(text,encoding='utf-8')
+          print('TargetLink SIL GUI patch prepared')
           PY
-# retrigger workflow
+      - name: Commit patch
+        run: |
+          rm -f .github/workflows/patch-sil.yml
+          git config user.name "smart-debugger-bot"
+          git config user.email "smart-debugger-bot@users.noreply.github.com"
+          git add +smartdebugger/SmartDebuggerApp.m +smartdebugger/TargetLinkSILManager.m .github/workflows/patch-sil.yml
+          git commit -m "Fix TargetLink SIL GUI to use native TargetLink execution"
+          git push origin main
