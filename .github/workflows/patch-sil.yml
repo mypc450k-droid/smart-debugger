@@ -15,6 +15,6 @@ jobs:
           from pathlib import Path
           print('SIL patch runner started')
           p=Path('.github/workflows/patch-sil.yml')
-          text=p.read_text()
-          print('workflow bytes', len(text))
+          print('workflow bytes', len(p.read_text()))
           PY
+# retrigger workflow
