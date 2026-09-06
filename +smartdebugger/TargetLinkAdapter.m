@@ -1,12 +1,8 @@
 classdef TargetLinkAdapter < handle
     %TARGETLINKADAPTER TargetLink compatibility/capability boundary.
     %
-    % The adapter is capability-driven. It does not branch on a TargetLink
-    % release number, so newer releases can use the same integration path.
-    % The TargetLink Data Server is accessed after SIL through the supported
-    % TargetLink logging API boundary, with the legacy TLDS MATLAB bridge used
-    % as a read-only extraction fallback where the public tl_access_logdata
-    % callable signature is not exposed to this integration layer.
+    % Capability-driven TargetLink integration. No TargetLink release number
+    % is hard-coded. MIL code is not touched by this adapter.
 
     methods (Static)
         function tf=isAvailable()
@@ -61,10 +57,17 @@ classdef TargetLinkAdapter < handle
         end
 
         function setSimulationMode(model,subsystem,mode)
-            if isempty(which('tl_set_sim_mode'))
+            if isempty(which('tl_set_sim_mode')), return; end
+            feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
+        end
+
+        function generateCode(model,subsystem)
+            if isempty(which('tl_generate_code'))
                 return
             end
-            feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
+            % TargetLink automation uses property/value arguments. Keep the
+            % call isolated so a future TargetLink signature can be adapted here.
+            feval('tl_generate_code','Model',model,'TlSubsystems',subsystem);
         end
 
         function buildHost(model,subsystem)
@@ -76,6 +79,14 @@ classdef TargetLinkAdapter < handle
                 error('SmartDebugger:TargetLinkHostBuildUnavailable', ...
                     'No TargetLink host-build API is available.');
             end
+        end
+
+        function compileHost(model,subsystem)
+            if isempty(which('tl_compile_host'))
+                error('SmartDebugger:TargetLinkHostCompileUnavailable', ...
+                    'TargetLink tl_compile_host is not available.');
+            end
+            feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
         end
 
         function message=simulate(model,subsystem)
@@ -91,25 +102,20 @@ classdef TargetLinkAdapter < handle
         end
 
         function [data,ok,message,method]=accessLogData(model,subsystem)
-            %ACCESSLOGDATA Read the simulation just completed from TL Data Server.
+            % Read the latest TargetLink Data Server simulation.
             %
-            % TargetLink publicly documents tl_access_logdata as the M-API for
-            % accessing stored simulation data, but its current callable action
-            % signature is not exposed by the public documentation available to
-            % this project. We therefore do not invent a signature. When the
-            % installed TargetLink provides the TLDS MATLAB bridge (tlds), we
-            % use its documented read/save sequence to retrieve the latest
-            % simulation into a temporary MAT file, then load that structure.
-            % This is read-only with respect to the model and does not alter
-            % logging configuration.
+            % dSPACE documents tl_access_logdata as the M-API for Data Server
+            % access. Its exact action signature is release-specific and is not
+            % exposed by the public material available to this project, so we do
+            % not invent one. If the installed release exposes the TLDS MATLAB
+            % bridge, its documented read/save sequence is used as a safe,
+            % read-only extraction fallback.
             data=[]; ok=false; message=''; method=''; %#ok<INUSD>
             if isempty(which('tl_access_logdata')) && isempty(which('tlds'))
                 message='No TargetLink Data Server access function is available.';
                 return
             end
 
-            % Prefer the TLDS bridge when available because its read/save
-            % contract is known and does not require guessing an action name.
             if ~isempty(which('tlds'))
                 try
                     simulations=feval('tlds',0,'get','simulations');
@@ -128,7 +134,7 @@ classdef TargetLinkAdapter < handle
                     loaded=load(tmp);
                     data=localExtractSavedPayload(loaded);
                     if isempty(data)
-                        message='TargetLink saved the simulation, but no usable logging payload was found in the saved data.';
+                        message='TargetLink saved the simulation, but no usable logging payload was found.';
                         return
                     end
                     ok=true;
@@ -140,9 +146,6 @@ classdef TargetLinkAdapter < handle
                 end
             end
 
-            % Keep tl_access_logdata as an explicit capability signal. We do
-            % not call it with a guessed signature because doing so could invoke
-            % the wrong Data Server action on a future TargetLink release.
             if ~isempty(which('tl_access_logdata'))
                 if isempty(message)
                     message='tl_access_logdata is installed, but its release-specific action signature is not invoked by Smart Debugger.';
