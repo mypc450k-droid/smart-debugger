@@ -292,7 +292,6 @@ classdef SimulationManager < handle
                 hs = ph.Outport;
                 displayDirection = 'Output';
             end
-
             loggingHandles = [];
             loggingNames = {};
             for k = 1:numel(hs)
@@ -338,19 +337,13 @@ classdef SimulationManager < handle
                     oldMode = obj.safeGetParam(srcPort,'DataLoggingNameMode','SignalName');
                     oldName = obj.safeGetParam(srcPort,'DataLoggingName','');
                     oldLimit = obj.safeGetParam(srcPort,'DataLoggingLimitDataPoints','off');
-                    oldMax = obj.safeGetParam(srcPort,'DataLoggingMaxPoints','5000');
                     tx.record(srcPort,'DataLogging',oldLogging);
                     tx.record(srcPort,'DataLoggingNameMode',oldMode);
                     tx.record(srcPort,'DataLoggingName',oldName);
                     tx.record(srcPort,'DataLoggingLimitDataPoints',oldLimit);
-                    tx.record(srcPort,'DataLoggingMaxPoints',oldMax);
                     try
-                        % Do not decimate or cap the selected signal. The
-                        % debugger needs the complete sample history from the
-                        % first logged sample through the end of simulation.
                         set_param(srcPort,'DataLoggingNameMode','Custom', ...
-                            'DataLoggingName',p.LogName, ...
-                            'DataLogging','on', ...
+                            'DataLoggingName',p.LogName,'DataLogging','on', ...
                             'DataLoggingLimitDataPoints','off');
                     catch ME
                         p.LogName = '';
@@ -477,8 +470,6 @@ classdef SimulationManager < handle
                 return;
             end
             dt = median(d);
-            % Normalize only the displayed number. The original time vector
-            % remains untouched and is what the plot/comparison uses.
             if abs(dt) < 1e-12
                 dt = 0;
             end
