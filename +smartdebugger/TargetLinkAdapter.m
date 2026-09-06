@@ -170,6 +170,7 @@ classdef TargetLinkAdapter < handle
 
         function setSimulationMode(model,subsystem,mode)
             if isempty(which('tl_set_sim_mode')), return; end
+            model=localModelName(model);
             feval('tl_set_sim_mode','Model',model,'TlSubsystems',subsystem,'SimMode',mode);
         end
 
@@ -177,10 +178,12 @@ classdef TargetLinkAdapter < handle
             if isempty(which('tl_generate_code'))
                 return
             end
+            model=localModelName(model);
             feval('tl_generate_code','Model',model,'TlSubsystems',subsystem);
         end
 
         function buildHost(model,subsystem)
+            model=localModelName(model);
             if ~isempty(which('tl_build_host'))
                 feval('tl_build_host','Model',model,'TlSubsystems',subsystem);
             elseif ~isempty(which('tl_compile_host'))
@@ -196,6 +199,7 @@ classdef TargetLinkAdapter < handle
                 error('SmartDebugger:TargetLinkHostCompileUnavailable', ...
                     'TargetLink tl_compile_host is not available.');
             end
+            model=localModelName(model);
             feval('tl_compile_host','Model',model,'TlSubsystems',subsystem);
         end
 
@@ -204,6 +208,7 @@ classdef TargetLinkAdapter < handle
                 error('SmartDebugger:TargetLinkSimulationUnavailable', ...
                     'TargetLink tl_sim is not available.');
             end
+            model=localModelName(model);
             % tl_sim is an action-style TargetLink command in supported releases
             % and must not be called with an output argument.
             feval('tl_sim','Model',model,'TlSubsystems',subsystem);
@@ -276,6 +281,7 @@ end
 end
 
 function name=localModelName(model)
+model=char(string(model));
 [~,name,ext]=fileparts(model);
 if isempty(ext), name=model; end
 end
