@@ -32,15 +32,36 @@ classdef SimulationManager < handle
             inputs = [];
             outputs = [];
             simOut = [];
+            logName = obj.uniqueLogName();
 
             try
                 root = obj.ensureModelLoaded(model,block);
                 get_param(block,'Handle');
+
+                % Force the model-level logging switches on for this debug run.
+                % Merely enabling DataLogging on a port is not sufficient when
+                % the TargetLink/TPT model has SignalLogging disabled or an
+                % inherited configuration that overrides it.
+                oldSignalLogging = obj.safeGetParam(root,'SignalLogging','on');
+                oldSignalLoggingName = obj.safeGetParam(root,'SignalLoggingName','logsout');
+                tx.record(root,'SignalLogging',oldSignalLogging);
+                tx.record(root,'SignalLoggingName',oldSignalLoggingName);
+                try
+                    set_param(root,'SignalLogging','on','SignalLoggingName',logName);
+                catch ME
+                    obj.Diagnostics.recordException(ME,'Enable model signal logging');
+                end
+
                 inputs = obj.instrumentPorts(block,'Inport',tx);
                 outputs = obj.instrumentPorts(block,'Outport',tx);
 
+                % Record the effective logging state so a TargetLink/TPT
+                % integration problem is visible instead of silently producing
+                % an empty Runtime Signals table.
+                obj.recordLoggingState(root,inputs,outputs,logName);
+
                 simArgs = {'SignalLogging','on', ...
-                    'SignalLoggingName','logsout', ...
+                    'SignalLoggingName',logName, ...
                     'ReturnWorkspaceOutputs','on'};
                 if ~obj.isAutoStopTime(stopTime)
                     simArgs = [simArgs {'StopTime',stopTime}]; %#ok<AGROW>
@@ -52,7 +73,7 @@ classdef SimulationManager < handle
                 simOut = sim(root,simArgs{:});
                 result.SimulationOutput = simOut;
 
-                logs = obj.getLogs(simOut);
+                logs = obj.getLogs(simOut,logName);
                 result.Inputs = obj.readLogged(logs,inputs);
                 result.Outputs = obj.readLogged(logs,outputs);
                 result.Time = obj.findCommonTime(result);
@@ -73,7 +94,8 @@ classdef SimulationManager < handle
                 if isempty(logs)
                     if isempty(errorMessage)
                         result.Status = 'PARTIAL';
-                        result.Message = 'Simulation completed, but logsout was not returned.';
+                        result.Message = ['Simulation completed, but no signal-log Dataset was returned. ' ...
+                            'See Diagnostics for the effective SignalLogging configuration.'];
                         obj.Diagnostics.record('WARNING',[mode ' capture'],result.Message, ...
                             'SmartDebugger:NoLogsout');
                     else
@@ -101,6 +123,53 @@ classdef SimulationManager < handle
                 result.Message = ME.message;
                 obj.Diagnostics.recordException(ME,[mode ' simulation']);
                 rethrow(ME);
+            end
+        end
+
+        function name = uniqueLogName(~)
+            name = matlab.lang.makeValidName(sprintf('SmartDebugger_logsout_%s', ...
+                char(string(java.util.UUID.randomUUID()))));
+        end
+
+        function recordLoggingState(obj,root,inputs,outputs,logName)
+            try
+                modelLogging = obj.safeGetParam(root,'SignalLogging','');
+                modelLoggingName = obj.safeGetParam(root,'SignalLoggingName','');
+                override = obj.safeGetParam(root,'DataLoggingOverride','');
+                obj.Diagnostics.record('INFO','Logging configuration', ...
+                    sprintf('Model SignalLogging=%s, SignalLoggingName=%s, DataLoggingOverride=%s, RunLogName=%s', ...
+                    char(string(modelLogging)),char(string(modelLoggingName)), ...
+                    obj.describeValue(override),logName), ...
+                    'SmartDebugger:LoggingConfiguration');
+            catch ME
+                obj.Diagnostics.recordException(ME,'Read logging configuration');
+            end
+            allPorts = [inputs outputs];
+            for k = 1:numel(allPorts)
+                if allPorts(k).LoggingHandle == -1
+                    continue;
+                end
+                dl = obj.safeGetParam(allPorts(k).LoggingHandle,'DataLogging','');
+                nm = obj.safeGetParam(allPorts(k).LoggingHandle,'DataLoggingName','');
+                obj.Diagnostics.record('INFO','Port logging configuration', ...
+                    sprintf('%s port %d: DataLogging=%s, DataLoggingName=%s', ...
+                    allPorts(k).Name,allPorts(k).Port,char(string(dl)),char(string(nm))), ...
+                    'SmartDebugger:PortLoggingConfiguration');
+            end
+        end
+
+        function text = describeValue(~,value)
+            if isempty(value)
+                text = '[]';
+                return;
+            end
+            try
+                text = char(string(value));
+            catch
+                text = class(value);
+            end
+            if numel(text) > 160
+                text = [text(1:157) '...'];
             end
         end
 
@@ -169,20 +238,56 @@ classdef SimulationManager < handle
             end
         end
 
-        function logs = getLogs(~,simOut)
+        function logs = getLogs(obj,simOut,logName)
             logs = [];
-            if isempty(simOut)
-                return;
-            end
-            try
-                if isprop(simOut,'logsout')
-                    logs = simOut.logsout;
+            if ~isempty(simOut)
+                try
+                    if isprop(simOut,logName)
+                        logs = simOut.(logName);
+                    end
+                catch
                 end
-            catch
+                if isempty(logs)
+                    try
+                        logs = simOut.get(logName);
+                    catch
+                    end
+                end
+                if isempty(logs)
+                    try
+                        if isprop(simOut,'logsout')
+                            logs = simOut.logsout;
+                        end
+                    catch
+                    end
+                end
+                if isempty(logs)
+                    try
+                        logs = simOut.get('logsout');
+                    catch
+                    end
+                end
+            end
+
+            % Some TargetLink/TPT configurations return logging data to the
+            % base workspace even when ReturnWorkspaceOutputs is enabled. Use
+            % the unique run-specific variable as a safe fallback.
+            if isempty(logs)
+                try
+                    if evalin('base',sprintf('exist(''%s'',''var'')',logName))
+                        logs = evalin('base',logName);
+                    end
+                catch
+                end
             end
             if isempty(logs)
                 try
-                    logs = simOut.get('logsout');
+                    if evalin('base','exist(''logsout'',''var'')')
+                        candidate = evalin('base','logsout');
+                        if isa(candidate,'Simulink.SimulationData.Dataset')
+                            logs = candidate;
+                        end
+                    end
                 catch
                 end
             end
@@ -257,9 +362,8 @@ classdef SimulationManager < handle
                     tx.record(srcPort,'DataLoggingName',oldName);
 
                     try
-                        set_param(srcPort,'DataLoggingNameMode','Custom');
-                        set_param(srcPort,'DataLoggingName',p.LogName);
-                        set_param(srcPort,'DataLogging','on');
+                        set_param(srcPort,'DataLoggingNameMode','Custom', ...
+                            'DataLoggingName',p.LogName,'DataLogging','on');
                     catch ME
                         p.LogName = '';
                         obj.Diagnostics.recordException(ME, ...
