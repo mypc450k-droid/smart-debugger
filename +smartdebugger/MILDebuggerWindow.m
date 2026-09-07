@@ -15,7 +15,7 @@ classdef MILDebuggerWindow < handle
     properties (Access=private)
         Tree ModelLabel BlockLabel StopTimeField RunButton StatusLabel
         InputsTable OutputsTable SampleTable DiagnosticsArea GraphGrid
-        Graphs = struct('Panel',{},'Axes',{},'DropDown',{},'Times',{},'Values',{},'Index',{},'CursorLine',{},'CursorText',{})
+        Graphs
         ActiveGraph = 1
         DragGraph = 0
         Busy = false
@@ -26,6 +26,7 @@ classdef MILDebuggerWindow < handle
             obj.DiagnosticsManager=smartdebugger.DiagnosticsManager();
             obj.ModelManager=smartdebugger.ModelManager(obj.DiagnosticsManager);
             obj.SimulationManager=smartdebugger.SimulationManager(obj.DiagnosticsManager);
+            obj.Graphs=struct('Panel',{},'Axes',{},'DropDown',{},'Times',{},'Values',{},'Index',{},'CursorLine',{},'CursorText',{});
             obj.buildUI();
             obj.autoDetectModel();
             if ~isempty(varargin), obj.configure(varargin{:}); end
@@ -94,21 +95,37 @@ classdef MILDebuggerWindow < handle
             n=numel(obj.Graphs)+1; if n>12, obj.status('Maximum of 12 MIL graphs reached.'); return; end
             p=uipanel(obj.GraphGrid,'Title',sprintf('Graph %d',n)); p.Layout.Column=mod(n-1,2)+1; p.Layout.Row=ceil(n/2);
             g=uigridlayout(p,[2 2]); g.RowHeight={28,'1x'}; g.ColumnWidth={'1x',65};
-            d=uidropdown(g,'Items',{'Select runtime signal'},'ItemsData',{''},'Value',''); d.Layout.Column=1; d.Layout.Row=1; d.ValueChangedFcn=@(s,~)obj.graphChanged(n,s);
-            uibutton(g,'Text','Remove','ButtonPushedFcn',@(~,~)obj.removeGraph(n));
+            d=uidropdown(g,'Items',{'Select runtime signal'},'ItemsData',{''},'Value',''); d.Layout.Column=1; d.Layout.Row=1; d.ValueChangedFcn=@(s,~)obj.graphChanged(obj.graphForDropdown(s),s);
+            uibutton(g,'Text','Remove','ButtonPushedFcn',@(~,~)obj.removeGraph(obj.graphForPanel(p)));
             ax=uiaxes(g); ax.Layout.Row=2; ax.Layout.Column=[1 2]; grid(ax,'on'); xlabel(ax,'Time (s)'); ylabel(ax,'Value');
             obj.Graphs(n)=struct('Panel',p,'Axes',ax,'DropDown',d,'Times',[],'Values',[],'Index',1,'CursorLine',[],'CursorText',[]);
-            obj.rebuildGraphs(); obj.refreshGraphChoices();
+            obj.rebuildGraphs(); obj.refreshGraphChoices(); obj.refreshGraphCallbacks();
         end
         function removeGraph(obj,n)
             if numel(obj.Graphs)<=1, obj.status('At least one graph must remain.'); return; end
-            if n>numel(obj.Graphs), return; end
+            if n<1||n>numel(obj.Graphs), return; end
             try, delete(obj.Graphs(n).Panel); catch, end
-            obj.Graphs(n)=[]; obj.rebuildGraphs(); obj.refreshGraphChoices();
+            obj.Graphs(n)=[]; obj.rebuildGraphs(); obj.refreshGraphChoices(); obj.refreshGraphCallbacks();
+            obj.ActiveGraph=min(obj.ActiveGraph,max(1,numel(obj.Graphs)));
         end
         function rebuildGraphs(obj)
-            n=numel(obj.Graphs); obj.GraphGrid.RowHeight=repmat({'1x'},1,ceil(n/2));
-            for k=1:n, obj.Graphs(k).Panel.Layout.Row=ceil(k/2); obj.Graphs(k).Panel.Layout.Column=mod(k-1,2)+1; end
+            n=numel(obj.Graphs); if n==0, return; end
+            obj.GraphGrid.RowHeight=repmat({'1x'},1,max(1,ceil(n/2)));
+            for k=1:n, obj.Graphs(k).Panel.Layout.Row=ceil(k/2); obj.Graphs(k).Panel.Layout.Column=mod(k-1,2)+1; obj.Graphs(k).Panel.Title=sprintf('Graph %d',k); end
+        end
+        function refreshGraphCallbacks(obj)
+            for k=1:numel(obj.Graphs)
+                p=obj.Graphs(k).Panel; d=obj.Graphs(k).DropDown;
+                d.ValueChangedFcn=@(s,~)obj.graphChanged(obj.graphForDropdown(s),s);
+                b=findobj(p,'Type','uibutton','-regexp','Text','^Remove$');
+                for j=1:numel(b), b(j).ButtonPushedFcn=@(~,~)obj.removeGraph(obj.graphForPanel(p)); end
+            end
+        end
+        function n=graphForDropdown(obj,d)
+            n=0; for k=1:numel(obj.Graphs), try, if isequal(obj.Graphs(k).DropDown,d), n=k; return; end, catch, end, end
+        end
+        function n=graphForPanel(obj,p)
+            n=0; for k=1:numel(obj.Graphs), try, if isequal(obj.Graphs(k).Panel,p), n=k; return; end, catch, end, end
         end
         function autoDetectModel(obj)
             m=obj.detectOpenModel(); if isempty(m), obj.ModelLabel.Text='No open Simulink model detected'; obj.status('Open the Simulink model, then press Refresh.'); return; end
@@ -135,7 +152,12 @@ classdef MILDebuggerWindow < handle
         end
         function inspectSelected(obj)
             if isempty(obj.SelectedBlock), obj.status('Select a block first.'); return; end
-            info=obj.ModelManager.inspectBlock(obj.SelectedBlock); if isempty(info), obj.status('Inspection failed.'); else, obj.status(['Inspected: ' obj.SelectedBlock]); end
+            try
+                info=obj.ModelManager.inspectBlock(obj.SelectedBlock);
+                if isempty(info), obj.status('Inspection failed.'); else, obj.status(['Inspected: ' obj.SelectedBlock]); end
+            catch ME
+                obj.handleError(ME,'Inspect block');
+            end
         end
         function runMIL(obj)
             if obj.Busy, return; end
@@ -180,8 +202,8 @@ classdef MILDebuggerWindow < handle
             if n>numel(obj.Graphs), return; end; d=obj.Graphs(n).DropDown; if any(strcmp(d.ItemsData,key)), d.Value=key; obj.graphChanged(n,d); end
         end
         function graphChanged(obj,n,d)
-            if n>numel(obj.Graphs)||isempty(obj.Result), return; end; key=char(string(d.Value)); [t,y,name]=obj.resolveSignal(key); obj.Graphs(n).Times=t; obj.Graphs(n).Values=y; obj.Graphs(n).Index=1; cla(obj.Graphs(n).Axes);
-            if isempty(t), title(obj.Graphs(n).Axes,'Select runtime signal'); return; end; obj.plotSignal(obj.Graphs(n).Axes,t,y); title(obj.Graphs(n).Axes,[name ' | drag cursor or use ←/→'],'Interpreter','none'); obj.updateCursor(n);
+            if n<1||n>numel(obj.Graphs)||isempty(obj.Result), return; end; key=char(string(d.Value)); [t,y,name]=obj.resolveSignal(key); obj.Graphs(n).Times=t; obj.Graphs(n).Values=y; obj.Graphs(n).Index=1; cla(obj.Graphs(n).Axes);
+            if isempty(t), title(obj.Graphs(n).Axes,'Select runtime signal'); return; end; obj.plotSignal(obj.Graphs(n).Axes,t,y); title(obj.Graphs(n).Axes,[name ' | drag cursor or use left/right arrows'],'Interpreter','none'); obj.updateCursor(n);
         end
         function [t,y,name]=resolveSignal(obj,key)
             t=[]; y=[]; name=''; if isempty(key), return; end; z=regexp(key,'^(Input|Output):(\d+)$','tokens','once'); if isempty(z), return; end; k=str2double(z{2}); if strcmp(z{1},'Input'), p=obj.Result.Inputs; else, p=obj.Result.Outputs; end
