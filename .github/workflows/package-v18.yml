@@ -11,9 +11,9 @@ jobs:
       - name: Create consolidated V18 ZIP
         run: |
           rm -rf .git
-          zip -qr SmartDebugger_V18.zip . -x '*.DS_Store'
+          zip -qr /tmp/SmartDebugger_V18.zip . -x '*.DS_Store' 'SmartDebugger_V18.zip'
       - name: Upload consolidated ZIP
         uses: actions/upload-artifact@v4
         with:
           name: SmartDebugger_V18
-          path: SmartDebugger_V18.zip
+          path: /tmp/SmartDebugger_V18.zip
