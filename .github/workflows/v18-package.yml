@@ -1,0 +1,19 @@
+name: Build Smart Debugger V18 package
+on:
+  push:
+    branches: [v18-package]
+  workflow_dispatch:
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create V18 ZIP
+        run: |
+          rm -rf .git
+          zip -r SmartDebugger_V18.zip . -x '*.DS_Store'
+      - name: Upload V18 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartDebugger_V18
+          path: SmartDebugger_V18.zip
